@@ -40,6 +40,8 @@ VLESS over WebSocket
 
 - 支持 VLESS over WebSocket 入口。
 - 支持 `/sstp://host:port` 指定 SSTP/SoftEther 服务端。
+- 支持通过环境变量 `UUID` 自定义 VLESS UUID（默认回退内置值）。
+- 访问 `/uuid` 自动生成 VLESS 分享链接。
 - 使用 Workers `connect()` 建立 TLS 出站连接。
 - 实现 SSTP `SSTP_DUPLEX_POST` 建链。
 - 实现 PPP 协商：LCP / PAP / IPCP。
@@ -120,6 +122,32 @@ FIN+ACK
 
 这也是本项目区别于普通 Worker TCP 转发的核心部分。
 
+## 环境变量
+
+在 Cloudflare Worker 的 `wrangler.toml` 或 Dashboard 中设置：
+
+| 变量 | 说明 | 默认值 |
+| --- | --- | --- |
+| `UUID` | VLESS UUID，客户端与此值校验匹配。 | `2523c510-9ff0-415b-9582-93949bfae7e3` |
+
+> SSTP 服务端地址（`/sstp://host:port?ed=2560`）由用户在 WebSocket path 中指定，不放入环境变量，方便随时切换。
+
+## `/uuid` 路由
+
+访问 `GET /uuid` 自动生成当前配置下的 VLESS 分享链接（纯文本），自动使用请求的 `Host` 头作为 Worker 域名，SSTP 地址使用占位符 `sstp_host:443`，用户根据实际路径自行替换。
+
+示例：
+
+```bash
+curl https://your-worker.example.com/uuid
+```
+
+输出：
+
+```text
+vless://2523c510-9ff0-415b-9582-93949bfae7e3@your-worker.example.com:443/?type=ws&encryption=none&host=your-worker.example.com&path=%2Fsstp%3A%2F%2Fsstp_host%3A443%3Fed%3D2560&security=tls&sni=your-worker.example.com&fp=chrome&packetEncoding=xudp#SSTP
+```
+
 ## 节点格式
 
 Worker WebSocket path 使用：
@@ -138,12 +166,16 @@ vless://<uuid>@<front-host>:<front-port>/?type=ws&encryption=none&host=<worker-h
 
 | 字段 | 说明 |
 | --- | --- |
-| `<uuid>` | 与 `Softether.js` 中的 `uuid` 一致。 |
+| `<uuid>` | 与环境变量 `UUID` 一致，未设置则使用内置默认值。 |
 | `<front-host>:<front-port>` | 客户端连接入口。 |
 | `host` / `sni` | Worker 域名。 |
 | `path` | URL 编码后的 `/sstp://sstp_host:port?ed=2560`。 |
 | `<sstp_host>:443` | SSTP / SoftEther 服务端地址。 |
 | `packetEncoding=xudp` | 客户端侧参数；本实现主要处理 VLESS TCP 流。 |
+
+## SSTP 认证
+
+Worker 通过 PPP PAP 协议向 SSTP 服务端认证，默认用户名和密码均为 `vpn`（base64 编码 `dnBu`）。如需修改，编辑 `Softether.js` 中的 `papCred` 变量。
 
 ## 与普通 Worker TCP 代理对比
 

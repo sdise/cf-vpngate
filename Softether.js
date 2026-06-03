@@ -1,7 +1,20 @@
 import { connect } from 'cloudflare:sockets';
-const uuid = '2523c510-9ff0-415b-9582-93949bfae7e3', maxED = 8192, MSS = 1400;
-export default { fetch: req => req.headers.get('Upgrade') === 'websocket' ? ws(req) : new Response('ok') };
-const idB = Uint8Array.fromHex(uuid.replaceAll('-', '')), dec = new TextDecoder(), enc = s => new TextEncoder().encode(s), E = new Uint8Array(0);
+const DEFAULT_UUID = '2523c510-9ff0-415b-9582-93949bfae7e3', maxED = 8192, MSS = 1400;
+const defaultIdB = Uint8Array.fromHex(DEFAULT_UUID.replaceAll('-', ''));
+const dec = new TextDecoder(), enc = s => new TextEncoder().encode(s), E = new Uint8Array(0);
+export default {
+  fetch: (req, env) => {
+    const url = new URL(req.url);
+    if (url.pathname === '/uuid') {
+      const uuid = env.UUID || DEFAULT_UUID;
+      const host = req.headers.get('Host') || url.host;
+      const path = encodeURIComponent('/sstp://sstp_host:443?ed=2560');
+      const link = `vless://${uuid}@${host}:443/?type=ws&encryption=none&host=${host}&path=${path}&security=tls&sni=${host}&fp=chrome&packetEncoding=xudp#SSTP`;
+      return new Response(link, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+    }
+    return req.headers.get('Upgrade') === 'websocket' ? ws(req, env) : new Response('ok');
+  }
+};
 const cat = (...a) => { const r = new Uint8Array(a.reduce((s, x) => s + x.length, 0)); a.reduce((o, x) => (r.set(x, o), o + x.length), 0); return r; };
 const u16 = (b, o) => b[o] << 8 | b[o + 1], u32 = (b, o) => (b[o] << 24 | b[o + 1] << 16 | b[o + 2] << 8 | b[o + 3]) >>> 0;
 const rng = n => crypto.getRandomValues(new Uint8Array(n)), rng16 = () => { const r = rng(2); return u16(r, 0); }, rng32 = () => { const r = rng(4); return u32(r, 0); };
@@ -9,7 +22,7 @@ const ipB = ip => new Uint8Array(ip.split('.').map(Number)), papCred = enc(atob(
 const cksum = (d, o, n) => { let s = 0; for (let i = o; i < o + n - 1; i += 2) s += u16(d, i); if (n & 1) s += d[o + n - 1] << 8; while (s >> 16) s = (s & 0xFFFF) + (s >> 16); return (~s) & 0xFFFF; };
 const addr = (t, b) => t === 3 ? dec.decode(b) : t === 1 ? `${b[0]}.${b[1]}.${b[2]}.${b[3]}` : `[${Array.from({ length: 8 }, (_, i) => u16(b, i * 2).toString(16)).join(':')}]`;
 const parseAddr = (b, o, t) => { const l = t === 3 ? b[o++] : t === 1 ? 4 : t === 4 ? 16 : 0; return l && o + l <= b.length ? { addrBytes: b.subarray(o, o + l), dataOffset: o + l } : null; };
-const vless = c => { for (let i = 0; i < 16; i++) if (c[i + 1] !== idB[i]) return null; const o = 19 + c[17], p = u16(c, o), t = c[o + 2] === 1 ? 1 : c[o + 2] + 1, a = parseAddr(c, o + 3, t); return a ? { addrType: t, ...a, port: p } : null; };
+const vless = (c, idB) => { for (let i = 0; i < 16; i++) if (c[i + 1] !== idB[i]) return null; const o = 19 + c[17], p = u16(c, o), t = c[o + 2] === 1 ? 1 : c[o + 2] + 1, a = parseAddr(c, o + 3, t); return a ? { addrType: t, ...a, port: p } : null; };
 const resolveIP = async h => /^\d+\.\d+\.\d+\.\d+$/.test(h) ? h : (await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(h)}&type=A`, { headers: { Accept: 'application/dns-json' } }).then(r => r.json()).catch(() => ({}))).Answer?.find(a => a.type === 1)?.data ?? null;
 const getSstp = url => { const m = decodeURIComponent(url).match(/\/sstp:\/\/([^?&#\s]*)/i); if (!m) return null; const [host, p] = m[1].split(':'); return p ? { host, port: +p } : null; };
 const relay = async (rd, send, close) => { try { for (;;) { const { done, value } = await rd.read(); if (done) break; value?.byteLength && send(value); } } catch {} finally { rd.releaseLock(); close(); } };
@@ -139,14 +152,15 @@ const sstpConn = async ({ host, port }, ipP, targetPort) => {
     return { readable, writable, close };
   } catch { close(); return null; }
 };
-const ws = async req => {
+const ws = async (req, env) => {
+  const idB = env.UUID ? Uint8Array.fromHex(env.UUID.replaceAll('-', '')) : defaultIdB;
   const [client, server] = Object.values(new WebSocketPair()); server.accept();
   const ed = req.headers.get('sec-websocket-protocol'), ep = getSstp(req.url);
   let w = null, sock = null, chain = Promise.resolve();
   const close = () => { try { sock?.close(); } catch {} try { server.close(); } catch {} }, send = d => { try { server.send(d); } catch {} };
   const process = async chunk => {
     if (w) return w.write(chunk);
-    const v = vless(chunk); if (!v) return close(); send(new Uint8Array([chunk[0], 0]));
+    const v = vless(chunk, idB); if (!v) return close(); send(new Uint8Array([chunk[0], 0]));
     const { addrType, addrBytes, dataOffset, port } = v, host = addr(addrType, addrBytes), payload = chunk.subarray(dataOffset);
     if (!ep) return close();
     sock = await sstpConn(ep, addrType === 1 ? host : resolveIP(host), port); if (!sock) return close();
