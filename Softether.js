@@ -132,8 +132,11 @@ const createTcp = (sstp, srcIp, dstIp, dstPort) => {
 const sstpConn = async ({ host, port }, ipP, targetPort) => {
   const sstp = createSstp(), close = () => sstp.close();
   try {
+    console.log(`[SSTP] connecting to ${host}:${port}`);
     await sstp.connect(host, port);
-    const [myIp, targetIp] = await Promise.all([sstp.establish(), ipP]); if (!targetIp) { close(); return null; }
+    console.log('[SSTP] TLS connected, establishing PPP...');
+    const [myIp, targetIp] = await Promise.all([sstp.establish(), ipP]); if (!targetIp) { console.log('[SSTP] DNS resolve failed'); close(); return null; }
+    console.log(`[SSTP] PPP OK, myIp=${myIp}, target=${targetIp}:${targetPort}`);
     const tcp = createTcp(sstp, myIp, targetIp, targetPort); await tcp.handshake();
     let ctrl = null;
     const readable = new ReadableStream({ start: c => { ctrl = c; }, cancel: close });
@@ -157,7 +160,7 @@ const sstpConn = async ({ host, port }, ipP, targetPort) => {
       }, close: () => sstp.wr.write(tcp.frame(0x11)).catch(() => {}), abort: close
     });
     return { readable, writable, close };
-  } catch { close(); return null; }
+  } catch (e) { console.log(`[SSTP] connection failed: ${e}`); close(); return null; }
 };
 const ws = async (req, env) => {
   const { uuid: pathUuid, sstp: ep } = parsePath(req.url);
@@ -165,18 +168,24 @@ const ws = async (req, env) => {
   const idB = Uint8Array.fromHex(uuid.replaceAll('-', ''));
   const [client, server] = Object.values(new WebSocketPair()); server.accept();
   const ed = req.headers.get('sec-websocket-protocol');
+  console.log(`[WS] url=${req.url} uuid=${uuid} ep=${ep ? ep.host+':'+ep.port : 'null'} ed=${ed ? ed.length : 0}B`);
   let w = null, sock = null, chain = Promise.resolve();
-  const close = () => { try { sock?.close(); } catch {} try { server.close(); } catch {} }, send = d => { try { server.send(d); } catch {} };
+  const close = () => { console.log('[WS] close'); try { sock?.close(); } catch {} try { server.close(); } catch {} }, send = d => { try { server.send(d); } catch {} };
   const process = async chunk => {
     if (w) return w.write(chunk);
-    const v = vless(chunk, idB); if (!v) return close(); send(new Uint8Array([chunk[0], 0]));
+    const v = vless(chunk, idB);
+    if (!v) { console.log(`[VLESS] uuid mismatch or bad header, chunk[0]=0x${chunk[0]?.toString(16)}, len=${chunk.length}`); return close(); }
+    send(new Uint8Array([chunk[0], 0]));
     const { addrType, addrBytes, dataOffset, port } = v, host = addr(addrType, addrBytes), payload = chunk.subarray(dataOffset);
-    if (!ep) return close();
-    sock = await sstpConn(ep, addrType === 1 ? host : resolveIP(host), port); if (!sock) return close();
-    w = sock.writable.getWriter(); payload.byteLength && await w.write(payload); relay(sock.readable.getReader(), send, close);
+    console.log(`[VLESS] target=${host}:${port} type=${addrType} payload=${payload.length}B`);
+    if (!ep) { console.log('[VLESS] no SSTP host in path'); return close(); }
+    try {
+      sock = await sstpConn(ep, addrType === 1 ? host : resolveIP(host), port); if (!sock) return close();
+      w = sock.writable.getWriter(); payload.byteLength && await w.write(payload); relay(sock.readable.getReader(), send, close);
+    } catch (e) { console.log(`[VLESS] sstpConn error: ${e}`); close(); }
   };
-  if (ed?.length <= maxED) chain = chain.then(() => process(Uint8Array.fromBase64(ed, { alphabet: 'base64url' }))).catch(close);
-  server.addEventListener('message', e => { chain = chain.then(() => process(new Uint8Array(e.data instanceof ArrayBuffer ? e.data : e.data.buffer ?? e.data))).catch(close); });
+  if (ed?.length <= maxED) chain = chain.then(() => process(Uint8Array.fromBase64(ed, { alphabet: 'base64url' }))).catch(e => { console.log(`[ED] error: ${e}`); close(); });
+  server.addEventListener('message', e => { chain = chain.then(() => process(new Uint8Array(e.data instanceof ArrayBuffer ? e.data : e.data.buffer ?? e.data))).catch(e2 => { console.log(`[MSG] error: ${e2}`); close(); }); });
   server.addEventListener('close', close); server.addEventListener('error', close);
   return new Response(null, { status: 101, webSocket: client, headers: ed ? { 'sec-websocket-protocol': ed } : {} });
 };
