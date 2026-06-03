@@ -124,49 +124,56 @@ FIN+ACK
 
 ## 环境变量
 
-在 Cloudflare Worker 的 `wrangler.toml` 或 Dashboard 中设置：
+在 Cloudflare Worker 的 `wrangler.toml` 或 Dashboard 中设置（可选）：
 
 | 变量 | 说明 | 默认值 |
 | --- | --- | --- |
-| `UUID` | VLESS UUID，客户端与此值校验匹配。 | `2523c510-9ff0-415b-9582-93949bfae7e3` |
+| `UUID` | VLESS UUID，客户端与此值校验匹配。设置后强制使用，忽略 path 中的 UUID。 | `2523c510-9ff0-415b-9582-93949bfae7e3` |
 
-> SSTP 服务端地址（`/sstp://host:port?ed=2560`）由用户在 WebSocket path 中指定，不放入环境变量，方便随时切换。
+> 混合模式：`env.UUID` 已设置时强制使用（锁定模式）；未设置时允许从 path 传入 UUID（开放模式）。SSTP 服务端地址始终从 path 中指定。
+
+## 路径格式
+
+Worker WebSocket path 支持以下格式：
+
+```text
+/<uuid>/sstp://sstp_host:port?ed=2560
+```
+
+- `<uuid>`：可选，VLESS UUID。未指定时使用环境变量 `UUID` 或内置默认值。
+- `/sstp://sstp_host:port?ed=2560`：SSTP 服务端地址。
+
+示例：
+
+```text
+/2523c510-9ff0-415b-9582-93949bfae7e3/sstp://443.jp:443?ed=2560
+/sstp://443.jp:443?ed=2560
+```
 
 ## `/uuid` 路由
 
-访问 `GET /uuid` 自动生成当前配置下的 VLESS 分享链接（纯文本），自动使用请求的 `Host` 头作为 Worker 域名，SSTP 地址使用占位符 `sstp_host:443`，用户根据实际路径自行替换。
+访问 `GET /uuid` 或 `GET /<uuid>` 自动生成 VLESS 分享链接（纯文本），自动使用请求的 `Host` 头作为 Worker 域名，SSTP 地址使用占位符 `sstp_host:443`，用户根据实际路径自行替换。
 
 示例：
 
 ```bash
 curl https://your-worker.example.com/uuid
-```
-
-输出：
-
-```text
-vless://2523c510-9ff0-415b-9582-93949bfae7e3@your-worker.example.com:443/?type=ws&encryption=none&host=your-worker.example.com&path=%2Fsstp%3A%2F%2Fsstp_host%3A443%3Fed%3D2560&security=tls&sni=your-worker.example.com&fp=chrome&packetEncoding=xudp#SSTP
+curl https://your-worker.example.com/2523c510-9ff0-415b-9582-93949bfae7e3
 ```
 
 ## 节点格式
 
-Worker WebSocket path 使用：
-
-```text
-/sstp://sstp_host:port?ed=2560
-```
-
 VLESS 分享链接模板：
 
 ```text
-vless://<uuid>@<front-host>:<front-port>/?type=ws&encryption=none&host=<worker-host>&path=%2Fsstp%3A%2F%2F<sstp_host>%3A443%3Fed%3D2560&security=tls&sni=<worker-host>&fp=chrome&packetEncoding=xudp#SSTP
+vless://<uuid>@<front-host>:<front-port>/?type=ws&encryption=none&host=<worker-host>&path=%2F<uuid>%2Fsstp%3A%2F%2F<sstp_host>%3A443%3Fed%3D2560&security=tls&sni=<worker-host>&fp=chrome&packetEncoding=xudp#SSTP
 ```
 
 字段说明：
 
 | 字段 | 说明 |
 | --- | --- |
-| `<uuid>` | 与环境变量 `UUID` 一致，未设置则使用内置默认值。 |
+| `<uuid>` | 可从 path 中传入，或使用环境变量 `UUID`，或内置默认值。 |
 | `<front-host>:<front-port>` | 客户端连接入口。 |
 | `host` / `sni` | Worker 域名。 |
 | `path` | URL 编码后的 `/sstp://sstp_host:port?ed=2560`。 |

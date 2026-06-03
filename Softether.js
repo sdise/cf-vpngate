@@ -1,15 +1,15 @@
 import { connect } from 'cloudflare:sockets';
 const DEFAULT_UUID = '2523c510-9ff0-415b-9582-93949bfae7e3', maxED = 8192, MSS = 1400;
-const defaultIdB = Uint8Array.fromHex(DEFAULT_UUID.replaceAll('-', ''));
 const dec = new TextDecoder(), enc = s => new TextEncoder().encode(s), E = new Uint8Array(0);
 export default {
   fetch: (req, env) => {
-    const url = new URL(req.url);
-    if (url.pathname === '/uuid') {
-      const uuid = env.UUID || DEFAULT_UUID;
+    const url = new URL(req.url), p = url.pathname;
+    const uuidMatch = p.match(/^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+    if (p === '/uuid' || uuidMatch) {
+      const uuid = env.UUID || (uuidMatch ? uuidMatch[1] : DEFAULT_UUID);
       const host = req.headers.get('Host') || url.host;
-      const path = encodeURIComponent('/sstp://sstp_host:443?ed=2560');
-      const link = `vless://${uuid}@${host}:443/?type=ws&encryption=none&host=${host}&path=${path}&security=tls&sni=${host}&fp=chrome&packetEncoding=xudp#SSTP`;
+      const vlessPath = encodeURIComponent('/sstp://sstp_host:443?ed=2560');
+      const link = `vless://${uuid}@${host}:443/?type=ws&encryption=none&host=${host}&path=${vlessPath}&security=tls&sni=${host}&fp=chrome&packetEncoding=xudp#SSTP`;
       return new Response(link, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
     }
     return req.headers.get('Upgrade') === 'websocket' ? ws(req, env) : new Response('ok');
@@ -22,9 +22,16 @@ const ipB = ip => new Uint8Array(ip.split('.').map(Number)), papCred = enc(atob(
 const cksum = (d, o, n) => { let s = 0; for (let i = o; i < o + n - 1; i += 2) s += u16(d, i); if (n & 1) s += d[o + n - 1] << 8; while (s >> 16) s = (s & 0xFFFF) + (s >> 16); return (~s) & 0xFFFF; };
 const addr = (t, b) => t === 3 ? dec.decode(b) : t === 1 ? `${b[0]}.${b[1]}.${b[2]}.${b[3]}` : `[${Array.from({ length: 8 }, (_, i) => u16(b, i * 2).toString(16)).join(':')}]`;
 const parseAddr = (b, o, t) => { const l = t === 3 ? b[o++] : t === 1 ? 4 : t === 4 ? 16 : 0; return l && o + l <= b.length ? { addrBytes: b.subarray(o, o + l), dataOffset: o + l } : null; };
-const vless = (c, idB) => { for (let i = 0; i < 16; i++) if (c[i + 1] !== idB[i]) return null; const o = 19 + c[17], p = u16(c, o), t = c[o + 2] === 1 ? 1 : c[o + 2] + 1, a = parseAddr(c, o + 3, t); return a ? { addrType: t, ...a, port: p } : null; };
+const vless = (c, idB) => { for (let i = 0; i < 16; i++) if (c[i + 1] !== idB[i]) return null; const o = 19 + c[17], t = c[o + 2] === 1 ? 1 : c[o + 2] + 1, a = parseAddr(c, o + 3, t); return a ? { addrType: t, ...a, port: u16(c, o) } : null; };
 const resolveIP = async h => /^\d+\.\d+\.\d+\.\d+$/.test(h) ? h : (await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(h)}&type=A`, { headers: { Accept: 'application/dns-json' } }).then(r => r.json()).catch(() => ({}))).Answer?.find(a => a.type === 1)?.data ?? null;
-const getSstp = url => { const m = decodeURIComponent(url).match(/\/sstp:\/\/([^?&#\s]*)/i); if (!m) return null; const [host, p] = m[1].split(':'); return p ? { host, port: +p } : null; };
+const parsePath = url => {
+  const raw = decodeURIComponent(url);
+  const uuidM = raw.match(/\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  const sstpM = raw.match(/\/sstp:\/\/([^?&#\s]*)/i);
+  const uuid = uuidM ? uuidM[1] : null;
+  const sstp = sstpM ? (([h, p]) => p ? { host: h, port: +p } : null)(sstpM[1].split(':')) : null;
+  return { uuid, sstp };
+};
 const relay = async (rd, send, close) => { try { for (;;) { const { done, value } = await rd.read(); if (done) break; value?.byteLength && send(value); } } catch {} finally { rd.releaseLock(); close(); } };
 const createSstp = () => {
   let buf = E, pppId = 1, sock, rd, wr, host, rb = new ArrayBuffer(65536);
@@ -153,9 +160,11 @@ const sstpConn = async ({ host, port }, ipP, targetPort) => {
   } catch { close(); return null; }
 };
 const ws = async (req, env) => {
-  const idB = env.UUID ? Uint8Array.fromHex(env.UUID.replaceAll('-', '')) : defaultIdB;
+  const { uuid: pathUuid, sstp: ep } = parsePath(req.url);
+  const uuid = env.UUID || pathUuid || DEFAULT_UUID;
+  const idB = Uint8Array.fromHex(uuid.replaceAll('-', ''));
   const [client, server] = Object.values(new WebSocketPair()); server.accept();
-  const ed = req.headers.get('sec-websocket-protocol'), ep = getSstp(req.url);
+  const ed = req.headers.get('sec-websocket-protocol');
   let w = null, sock = null, chain = Promise.resolve();
   const close = () => { try { sock?.close(); } catch {} try { server.close(); } catch {} }, send = d => { try { server.send(d); } catch {} };
   const process = async chunk => {
