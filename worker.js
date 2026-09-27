@@ -1,9 +1,8 @@
 /**
  * cf-vpngate
  * -----------------------------------------------------------------------------
- * 入站（前端）：VLESS over WebSocket / VLESS over XHTTP
- * 出站（后端）：SSTP（VPN Gate 公共节点）/ ProxyIP 直连 / !txt 列表 /
- *              socks5 / http(s) 代理
+ * 入站（前端）：VLESS over WebSocket / VLESS over XHTTP（只支持 mode=stream-one）
+ * 出站（后端）：SSTP（VPN Gate 公共节点） / ProxyIP（含 `域名!txt` 列表）
  *
  * 可直接作为 Cloudflare Worker 部署（需 `wrangler.toml`），
  * 也可整段粘贴到 Cloudflare Snippets / Dashboard 快速编辑器中使用。
@@ -11,7 +10,7 @@
  * 设计要点：
  *   - 有冲突的实现细节以 jacobax/snippets 的 snippet.js 为准；
  *   - 入站只保留 VLESS（ws + xhttp），去掉 trojan / ss 入站与 ss2022 加解密；
- *   - 出站以 SSTP（VPN Gate）+ ProxyIP 为主，保留 !txt / socks5 / http(s) 以便链式落地；
+ *   - 出站只保留 SSTP 与 ProxyIP 两种，去掉 socks5 / http(s) / turn(s) 等落地；
  *   - UDP 仅支持 53 端口（DNS），由 Worker 转成 TCP 上的 DNS 查询再回写。
  */
 
@@ -24,12 +23,8 @@ import { connect } from 'cloudflare:sockets';
 const CONFIG = {
   /** VLESS UUID：可用 Worker 变量 UUID / Snippet 全局 UUID 覆盖 */
   uuid: '495c7195-85b8-498a-bf20-2ea9ce9175b5',
-  /** 默认落地（ProxyIP）：host:port / domain!txt / sstp:// / socks5:// / https:// */
+  /** 默认落地：ProxyIP（host:port / 域名 / 域名!txt）或 sstp://host:port */
   proxyip: 'proxyip.example.com!txt',
-  /** auto=1 / auto=2 自适应 proxyip 的域名模板：`${colo}.${autoDomain}` */
-  autoDomain: 'proxy.zjcloud.us.ci',
-  /** 直连并发拨号数（>1 时取最快的一条，其余关闭） */
-  race: 1,
   /** socket → WebSocket 的读块大小 */
   chunk: 65536,
   /** 下行（落地 → 客户端）组包上限 */
@@ -288,31 +283,18 @@ const resolveTXT = async host => {
  * ========================================================================== */
 
 /**
- * 解析落地地址：
- *   sstp://host:443            → SSTP（VPN Gate）
- *   socks5://user:pass@h:1080  → SOCKS5
- *   http(s)://user:pass@h:port → HTTP CONNECT
- *   1.2.3.4:443 / [v6]:443     → ProxyIP 直连
- *   纯域名                      → ProxyIP 直连（443）
+ * 解析落地地址，只支持两种出站：
+ *   sstp://host:443             → SSTP（VPN Gate / SoftEther）
+ *   sstp://user:pass@host:443   → 自定义 PAP 认证的 SSTP
+ *   1.2.3.4:443 / [v6]:443      → ProxyIP
+ *   纯域名（默认 443）           → ProxyIP
+ * 其它带协议的写法（socks5://、http(s)://、turn://…）一律视为不支持，返回 null。
  */
 function parseProxyAddress(raw) {
-  if (!raw) return null;
-  const input = String(raw).trim();
-  const generic = (scheme, plainPort, tlsPort) => {
-    try {
-      const secure = input.startsWith(`${scheme}s://`);
-      const url = new URL(input);
-      return {
-        type: secure ? `${scheme}s` : scheme,
-        host: url.hostname,
-        port: parseInt(url.port, 10) || (secure ? tlsPort : plainPort),
-        username: url.username ? decodeURIComponent(url.username) : '',
-        password: url.password ? decodeURIComponent(url.password) : '',
-      };
-    } catch { return null; }
-  };
+  const input = String(raw || '').trim();
+  if (!input) return null;
 
-  if (input.startsWith('sstp://')) {
+  if (/^sstp:\/\//i.test(input)) {
     try {
       const url = new URL(input);
       return {
@@ -324,32 +306,19 @@ function parseProxyAddress(raw) {
       };
     } catch { return null; }
   }
-  if (input.startsWith('socks://') || input.startsWith('socks5://')) {
-    try {
-      const url = new URL(input.replace(/^socks:\/\//, 'socks5://'));
-      return {
-        type: 'socks5',
-        host: url.hostname,
-        port: parseInt(url.port, 10) || 1080,
-        username: url.username ? decodeURIComponent(url.username) : '',
-        password: url.password ? decodeURIComponent(url.password) : '',
-      };
-    } catch { return null; }
-  }
-  if (input.startsWith('http://') || input.startsWith('https://')) return generic('http', 80, 443);
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) return null; // 其它协议不再支持
 
   const bracketed = input.match(/^\[([^\]]+)\](?::(\d+))?$/);
   if (bracketed) {
     const port = parseInt(bracketed[2], 10);
-    return { type: 'direct', host: bracketed[1], port: !isNaN(port) && port > 0 ? port : 443 };
+    return { type: 'proxyip', host: bracketed[1], port: !isNaN(port) && port > 0 ? port : 443 };
   }
   const colon = input.lastIndexOf(':');
   if (colon > 0) {
-    const host = input.slice(0, colon);
     const port = parseInt(input.slice(colon + 1), 10);
-    if (!isNaN(port) && port > 0 && port <= 65535) return { type: 'direct', host, port };
+    if (!isNaN(port) && port > 0 && port <= 65535) return { type: 'proxyip', host: input.slice(0, colon), port };
   }
-  return { type: 'direct', host: input, port: 443 };
+  return { type: 'proxyip', host: input, port: 443 };
 }
 
 /* ==========================================================================
@@ -360,125 +329,6 @@ function parseProxyAddress(raw) {
 async function tcpConnect(host, port) {
   const socket = connect({ hostname: String(host).replace(/^\[|\]$/g, ''), port }, { allowHalfOpen: true });
   try { await socket.opened; return socket; } catch (err) { tryClose(socket); throw err; }
-}
-
-/** 并发拨号取最快（CONFIG.race > 1 时启用） */
-async function raceConnect(host, port) {
-  if (CONFIG.race < 2) return tcpConnect(host, port);
-  let winner = null;
-  const tasks = [];
-  for (let i = 0; i < CONFIG.race; i++) {
-    tasks.push(
-      tcpConnect(host, port).then(socket => {
-        if (winner) { tryClose(socket); return Promise.reject(0); }
-        winner = socket;
-        return socket;
-      }),
-    );
-  }
-  try { return await Promise.any(tasks); } catch { throw new Error(`race connect failed: ${host}:${port}`); }
-}
-
-/** SOCKS5 客户端（含用户名密码认证） */
-async function socksConnect(proxy, targetHost, targetPort) {
-  let socket;
-  try {
-    socket = await tcpConnect(proxy.host, proxy.port);
-    const writer = socket.writable.getWriter();
-    const reader = socket.readable.getReader();
-
-    await writer.write(proxy.username && proxy.password ? new Uint8Array([5, 2, 0, 2]) : new Uint8Array([5, 1, 0]));
-    const greeting = await reader.read();
-    if (greeting.done || greeting.value.byteLength < 2) throw new Error('socks5: bad greeting');
-    const method = new Uint8Array(greeting.value)[1];
-
-    if (method === 2) {
-      const user = encode(proxy.username);
-      const pass = encode(proxy.password);
-      const auth = new Uint8Array(3 + user.length + pass.length);
-      auth[0] = 1;
-      auth[1] = user.length;
-      auth.set(user, 2);
-      auth[2 + user.length] = pass.length;
-      auth.set(pass, 3 + user.length);
-      await writer.write(auth);
-      const authResp = await reader.read();
-      if (authResp.done || new Uint8Array(authResp.value)[1] !== 0) throw new Error('socks5: auth failed');
-    } else if (method !== 0) {
-      throw new Error('socks5: no acceptable method');
-    }
-
-    const hostBytes = encode(targetHost);
-    const request = new Uint8Array(7 + hostBytes.length);
-    request.set([5, 1, 0, 3, hostBytes.length]);
-    request.set(hostBytes, 5);
-    new DataView(request.buffer).setUint16(5 + hostBytes.length, targetPort, false);
-    await writer.write(request);
-
-    const reply = await reader.read();
-    if (reply.done || new Uint8Array(reply.value)[1] !== 0) throw new Error('socks5: connect rejected');
-
-    writer.releaseLock();
-    reader.releaseLock();
-    return socket;
-  } catch (err) {
-    tryClose(socket);
-    throw err;
-  }
-}
-
-/** HTTP / HTTPS CONNECT 代理 */
-async function httpConnect(proxy, targetHost, targetPort) {
-  let socket;
-  try {
-    socket = connect(
-      { hostname: proxy.host, port: proxy.port },
-      { secureTransport: proxy.type === 'https' ? 'on' : 'off', allowHalfOpen: true },
-    );
-    await socket.opened;
-
-    let request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
-    if (proxy.username) {
-      request += `Proxy-Authorization: Basic ${btoa(`${proxy.username}:${proxy.password || ''}`)}\r\n`;
-    }
-    request += 'User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n';
-
-    const writer = socket.writable.getWriter();
-    await writer.write(encode(request));
-    writer.releaseLock();
-
-    const reader = socket.readable.getReader();
-    let buffer = EMPTY;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done || !value) throw new Error('http proxy: closed');
-      buffer = concat(buffer, value);
-      if (buffer.length >= 12 && buffer[9] !== 50) throw new Error('http proxy: non-2xx'); // '2' === 50
-
-      let headerEnd = -1;
-      for (let i = 0; i <= buffer.length - 4; i++) {
-        if (buffer[i] === 13 && buffer[i + 1] === 10 && buffer[i + 2] === 13 && buffer[i + 3] === 10) { headerEnd = i + 4; break; }
-      }
-      if (headerEnd !== -1) {
-        releaseLock(reader);
-        const leftover = buffer.subarray(headerEnd);
-        if (leftover.length) {
-          // 代理在响应尾部夹带了目标数据，用 TransformStream 接回
-          const { readable, writable } = new TransformStream();
-          const bridge = writable.getWriter();
-          bridge.write(leftover);
-          bridge.releaseLock();
-          socket.readable.pipeTo(writable).catch(() => {});
-          return { readable, writable: socket.writable, close: () => tryClose(socket) };
-        }
-        return socket;
-      }
-      if (buffer.length > 8192) throw new Error('http proxy: header too large');
-    }
-  } catch (err) {
-    tryClose(socket);
-    throw err;
-  }
 }
 
 /* ------------------------------- SSTP ---------------------------------- */
@@ -909,52 +759,63 @@ async function sstpConnect(server, targetHost, targetPort) {
 }
 
 /* ==========================================================================
- * 6. 统一出站调度
+ * 6. 出站调度（只有 SSTP 与 ProxyIP 两种）
  * ========================================================================== */
 
 let txtDomain = null;
 let txtEntries = null;
 
 /**
- * @param {string} targetHost   客户端请求的目标
+ * 把落地字符串解析成 { type: 'sstp' | 'proxyip', host, port, ... }。
+ * `域名!txt`：从该域名 TXT 记录里随机取一条（值可以是 sstp:// 或 ProxyIP），带缓存。
+ */
+async function resolveProxyEntry(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return null;
+
+  if (text.toLowerCase().endsWith('!txt')) {
+    const domain = text.slice(0, -4).trim();
+    try {
+      if (txtDomain !== domain || !txtEntries) {
+        const list = await resolveTXT(domain);
+        if (list.length) { txtDomain = domain; txtEntries = list; }
+      }
+      if (txtEntries?.length) {
+        const picked = parseProxyAddress(txtEntries[Math.floor(Math.random() * txtEntries.length)]);
+        if (picked) return picked;
+      }
+    } catch { /* 解析失败就把域名本身当 ProxyIP */ }
+    return { type: 'proxyip', host: domain, port: 443 };
+  }
+  return parseProxyAddress(text);
+}
+
+/**
+ * 建立出站连接。
+ * @param {string} targetHost  客户端请求的目标
  * @param {number} targetPort
- * @param {string|Function} proxy  落地配置（字符串或惰性函数）
- * @param {string} globalMode  '1' 表示强制走落地，否则先尝试直连再回落
+ * @param {string} proxy       落地地址（空则用 CONFIG.proxyip）
+ * @param {string} globalMode  '1' 表示强制走落地，否则先试直连再回落
+ * @returns {Promise<{readable, writable, close}|null>} 失败返回 null
  */
 async function dialOutbound(targetHost, targetPort, proxy, globalMode) {
+  // 默认先直连（部分目标直连更快），失败再回落落地
   if (globalMode !== '1') {
-    try { return await raceConnect(targetHost, targetPort); } catch { /* 回落到 proxyip */ }
+    try { return await tcpConnect(targetHost, targetPort); } catch { /* 回落落地 */ }
   }
 
-  const raw = String((typeof proxy === 'function' ? proxy() : proxy) || CONFIG.proxyip).trim();
-
-  const pickEntry = async () => {
-    if (raw.toLowerCase().endsWith('!txt')) {
-      const domain = raw.slice(0, -4).trim();
-      try {
-        if (txtDomain !== domain || !txtEntries) {
-          const list = await resolveTXT(domain);
-          if (list.length) { txtEntries = list; txtDomain = domain; }
-        }
-        if (txtEntries?.length) {
-          const picked = parseProxyAddress(txtEntries[Math.floor(Math.random() * txtEntries.length)]);
-          if (picked) return picked;
-        }
-      } catch { /* 解析失败则把域名当直连 */ }
-      return { type: 'direct', host: domain, port: 443 };
-    }
-    return parseProxyAddress(raw) || { type: 'direct', host: raw, port: 443 };
-  };
-
-  const entry = await pickEntry();
-  log('dial', targetHost, targetPort, 'via', entry.type, entry.host, entry.port);
+  const entry = await resolveProxyEntry(proxy || CONFIG.proxyip);
+  if (!entry) {
+    log('unsupported proxy', proxy);
+    return null;
+  }
+  log('dial', `${targetHost}:${targetPort}`, 'via', entry.type, `${entry.host}:${entry.port}`);
 
   try {
-    if (entry.type === 'socks5') return await socksConnect(entry, targetHost, targetPort);
-    if (entry.type === 'http' || entry.type === 'https') return await httpConnect(entry, targetHost, targetPort);
+    // SSTP：隧道内手搓 IPv4/TCP 连目标
     if (entry.type === 'sstp') return await sstpConnect(entry, targetHost, targetPort);
     // ProxyIP：直连该 IP/域名，由它按 SNI 反代到真正的目标
-    return await raceConnect(entry.host, entry.port);
+    return await tcpConnect(entry.host, entry.port);
   } catch (err) {
     log('dial error', err?.message || err);
     return null;
@@ -1024,7 +885,7 @@ async function dnsOverTcp(query, host = CONFIG.dnsServer, port = CONFIG.dnsPort)
   for (let attempt = 0; attempt < 2; attempt++) {
     let socket;
     try {
-      socket = await raceConnect(host, port);
+      socket = await tcpConnect(host, port);
       const writer = socket.writable.getWriter();
       const reader = socket.readable.getReader();
       let buffer = EMPTY;
@@ -1244,40 +1105,34 @@ function extractEarlyData(request) {
 }
 
 /**
- * 解析 path：`/fdip=<落地>?ed=2560`
- * @returns {{ proxy: string|null, embeddedQuery: string }}
+ * 从 path 里取出落地地址：`/fdip=<落地>?ed=2560`
+ * 键名任意（fdip / proxy / p…），值就是落地；取不到返回 null。
  */
-function parsePath(url) {
+function parsePathProxy(url) {
   let raw = url.pathname + (url.search || '');
   if (raw.startsWith('/')) raw = raw.slice(1);
   try { raw = decodeURIComponent(raw); } catch { /* 保持原样 */ }
 
   const queryAt = raw.indexOf('?');
   const main = queryAt < 0 ? raw : raw.slice(0, queryAt);
-  const embeddedQuery = queryAt < 0 ? '' : raw.slice(queryAt + 1);
-
   const equalAt = main.indexOf('=');
-  if (equalAt <= 0) return { proxy: null, embeddedQuery };
+  if (equalAt <= 0) return null;
 
   const value = main.slice(equalAt + 1).trim();
-  if (!value) return { proxy: null, embeddedQuery };
+  if (!value) return null;
 
-  const schemeMatch = value.match(/^((?:socks5?|https?|sstp):\/\/[^/?#]+(?:\/[^?#]*)?)/i);
-  return {
-    proxy: schemeMatch
-      ? schemeMatch[1]
-      : value.indexOf('/') >= 0
-        ? value.slice(0, value.indexOf('/')).trim()
-        : value,
-    embeddedQuery,
-  };
+  // 值只可能是 sstp://host:port 或 ProxyIP（host:port / 域名）
+  const scheme = value.match(/^sstp:\/\/[^/?#]+/i);
+  if (scheme) return scheme[0];
+  const slash = value.indexOf('/');
+  return slash >= 0 ? value.slice(0, slash).trim() : value;
 }
 
 /* ==========================================================================
  * 11. 入站：WebSocket
  * ========================================================================== */
 
-async function handleWebSocket(request, uuidBytes, resolveProxy, globalMode) {
+async function handleWebSocket(request, uuidBytes, proxy, globalMode) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   server.binaryType = 'arraybuffer';
@@ -1348,7 +1203,7 @@ async function handleWebSocket(request, uuidBytes, resolveProxy, globalMode) {
             continue;
           }
 
-          const socket = await dialOutbound(session.host, session.port, resolveProxy, globalMode);
+          const socket = await dialOutbound(session.host, session.port, proxy, globalMode);
           if (!socket) throw new Error('dial failed');
           if (closed) { tryClose(socket); break; }
 
@@ -1560,7 +1415,7 @@ async function bridgeXhttp(session, source, request, remote, transform, output) 
   }
 }
 
-async function handleXhttp(request, uuidBytes, uuid, resolveProxy, globalMode) {
+async function handleXhttp(request, uuidBytes, uuid, proxy, globalMode) {
   if (!request.body) return xhttpError(400, 'empty body');
   if (!paddingAcceptable(extractXhttpPadding(request, uuid))) return xhttpError(400, 'bad padding');
 
@@ -1589,7 +1444,7 @@ async function handleXhttp(request, uuidBytes, uuid, resolveProxy, globalMode) {
   if (session.udp) return xhttpUdpResponse(session, source, headers);
 
   // 先建连再返回响应：失败时给出干净的 502，而不是一条被中断的流
-  const remote = await dialOutbound(session.host, session.port, resolveProxy, globalMode);
+  const remote = await dialOutbound(session.host, session.port, proxy, globalMode);
   if (!remote) {
     releaseLock(source.reader);
     log('xhttp dial failed', session.host, session.port);
@@ -1677,24 +1532,12 @@ export default {
       const uuid = String(env?.UUID || globalThis.UUID || '').trim() || CONFIG.uuid;
       const uuidBytes = getUuidBytes(uuid);
       const globalMode = request.headers.get('global') || url.searchParams.get('global') || '';
-
-      const resolveProxy = () => {
-        const { proxy, embeddedQuery } = parsePath(url);
-        const embedded = new URLSearchParams(embeddedQuery);
-        const auto = url.searchParams.get('auto') || embedded.get('auto');
-        const colo = (request.cf?.colo || '').toLowerCase();
-        const zj = `${colo}.${CONFIG.autoDomain}`;
-        const hasDefault = Boolean(CONFIG.proxyip) && !/example/i.test(CONFIG.proxyip);
-        const fallback = hasDefault ? CONFIG.proxyip : zj;
-
-        if (auto === '1') return colo === 'hkg' ? proxy || fallback : zj;
-        if (auto === '2') return zj;
-        return proxy || fallback;
-      };
+      // 落地：path 里的优先，否则用 CONFIG.proxyip
+      const proxy = parsePathProxy(url) || CONFIG.proxyip;
 
       return isWebSocket
-        ? await handleWebSocket(request, uuidBytes, resolveProxy, globalMode)
-        : await handleXhttp(request, uuidBytes, uuid, resolveProxy, globalMode);
+        ? await handleWebSocket(request, uuidBytes, proxy, globalMode)
+        : await handleXhttp(request, uuidBytes, uuid, proxy, globalMode);
     } catch (err) {
       log('fetch error', err?.message || err);
       return new Response(null, { status: 500 });

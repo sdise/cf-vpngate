@@ -38,11 +38,10 @@ Cloudflare Worker  ── 本仓库
    │
    ├─ 直连（默认优先）：connect(目标)
    │
-   └─ 落地（proxyip / SSTP / socks5 / http(s)）：
+   └─ 落地（只有两种）：
         ├─ ProxyIP        → connect(proxyip:443)，由它按 SNI 反代到目标
         ├─ SSTP           → SSTP over TLS → PPP → 虚拟 IPv4 → 手工 TCP → 目标
-        ├─ socks5 / http(s) → CONNECT 目标
-        └─ 域名!txt        → 取 TXT 记录里的任意一种上面地址，随机选一个
+        └─ 域名!txt        → 从 TXT 记录里随机取一条上面两种地址
    ▼
 目标网站 / 目标服务器
 ```
@@ -66,7 +65,7 @@ VLESS over WS/XHTTP
 | 项目 | 旧版 `CF-SoftEther` | 重构后 `cf-vpngate` |
 | --- | --- | --- |
 | 入站 | 仅 VLESS over WebSocket | **VLESS over WebSocket + VLESS over XHTTP**（`mode=stream-one`、Early Data、padding 混淆） |
-| 后端 | 仅 SSTP（path 里写死 `sstp://`） | **SSTP + ProxyIP + !txt + socks5 + http(s)**，统一调度 |
+| 后端 | 仅 SSTP（path 里写死 `sstp://`） | **只保留两种：SSTP + ProxyIP**（含 `域名!txt` 列表），统一调度 |
 | DNS | 每次请求都打 DoH | DoH 结果缓存 3 分钟 + 同域名并发去重 |
 | TXT 落地 | 无 | 支持 `域名!txt`，列表缓存，随机取一条 |
 | 上行 | 逐条 `write` | 分片入队 + 出队合并，队列 8MB 上限，带反压 |
@@ -112,9 +111,7 @@ Snippets 没有环境变量，改 UUID 直接在文件顶部改 `CONFIG.uuid`，
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `uuid` | `495c7195-85b8-498a-bf20-2ea9ce9175b5` | VLESS UUID。可用 Worker 变量 `UUID` 或全局变量 `UUID` 覆盖 |
-| `proxyip` | `proxyip.example.com!txt` | 默认落地。支持 `1.2.3.4:443` / `域名!txt` / `sstp://host:443` / `socks5://host:1080` / `https://host:443` |
-| `autoDomain` | `proxy.zjcloud.us.ci` | `auto=1/2` 时用的自适应 proxyip 域名模板（`${colo}.${autoDomain}`） |
-| `race` | `1` | 直连并发拨号数，>1 时取最快的一条并关掉其余 |
+| `proxyip` | `proxyip.example.com!txt` | 默认落地。只支持 `1.2.3.4:443` / `[v6]:443` / `域名` / `域名!txt` / `sstp://host:443` |
 | `chunk` | `65536` | socket → WebSocket 读块大小 |
 | `dnPack` / `dnTail` / `dnMs` | `65536` / `2048` / `2` | 下行攒包上限、剩余空间阈值、延迟冲刷毫秒 |
 | `upPack` | `65536` | 上行入队分片大小 |
@@ -137,15 +134,14 @@ Worker 环境变量：`UUID`（可选）。其余全部走 path 传入，改落�
 ## 路径与参数
 
 ```text
-/fdip=<落地地址>?ed=2560[&global=1][&auto=1]
+/fdip=<落地地址>?ed=2560[&global=1]
 ```
 
 - `fdip`：键名可任意（如 `proxy`、`p`、`1234`），值就是落地地址；
 - `ed=2560`：Early Data，客户端侧参数，**放最后**；
-- `global=1`：强制走落地（默认先尝试直连，失败再回落落地）；
-- `auto=1` / `auto=2`：自适应 proxyip（`1`：hkg 优先 path 指定，其它走 zj；`2`：全部 zj）。
+- `global=1`：强制走落地（默认先尝试直连，失败再回落落地）。
 
-落地地址写法：
+落地地址写法（只有两种出站）：
 
 | 写法 | 含义 |
 | --- | --- |
@@ -154,8 +150,8 @@ Worker 环境变量：`UUID`（可选）。其余全部走 path 传入，改落�
 | `sub.example.com!txt` | 取该域名 TXT 记录里的一条地址（逗号/换行分隔，随机选） |
 | `sstp://host:443` | SSTP（VPN Gate / SoftEther），默认 `vpn:vpn` |
 | `sstp://user:pass@host:443` | 自定义 PAP 认证的 SSTP |
-| `socks5://host:1080`、`socks5://u:p@host:1080` | SOCKS5 落地 |
-| `http://host:8080`、`https://host:443` | HTTP CONNECT 落地 |
+
+`socks5://`、`http(s)://`、`turn(s)://` 等写法已不再支持，写了会被当成无效落地并返回失败。
 
 示例：
 
@@ -164,7 +160,6 @@ Worker 环境变量：`UUID`（可选）。其余全部走 path 传入，改落�
 /fdip=vpn1234.opengw.net:443?ed=2560
 /fdip=1.2.3.4:443?ed=2560&global=1
 /fdip=william.us.ci!txt?ed=2560
-/?auto=1&ed=2560
 ```
 
 ---
@@ -367,7 +362,7 @@ VLESS 的 UDP 只处理 **53 端口（DNS）**：Worker 把 DNS 查询包通过 
 
 ## 优化点
 
-1. **去除了 trojan / ss 入站与 ss2022 加解密**：冷启动更快、内存更省，代码量减半；
+1. **只留必要功能**：入站只有 VLESS（ws + xhttp），出站只有 SSTP + ProxyIP；去掉 trojan/ss 入站与 ss2022 加解密、socks5/http(s)/turn(s) 落地、并发竞速拨号与自适应 proxyip（`auto=1/2`），文件更短、冷启动更快、内存更省；
 2. **XHTTP 先建连再返回响应**：落地失败直接 `502`，首包/padding 非法直接 `400`，不再给客户端一条被中断的流；
 3. **XHTTP padding 对齐 edgetunnel**：请求侧提取 + 严格模式校验 + 响应侧回填随机 padding，obfs 行为与客户端 extra 匹配；
 4. **DNS 缓存 + 并发去重**：同一域名 3 分钟内复用，并发请求共用一个查询；
@@ -379,7 +374,19 @@ VLESS 的 UDP 只处理 **53 端口（DNS）**：Worker 把 DNS 查询包通过 
 10. **超时统一**：WS/XHTTP 首包等待超时、SSTP 握手 10s、长连接等待 60s，避免 Worker 空转；
 11. **半开连接**：`allowHalfOpen` + FIN 处理，落地侧先关闭时也能把残余数据回传；
 12. **异常收口**：`dialOutbound` 失败统一返回 `null`，所有路径 `try/catch`，`fetch` 一律返回合法 `Response`；
-13. **配置集中**：`CONFIG` 一处可调，日志用 `CONFIG.debug` 开关。
+13. **配置集中**：`CONFIG` 一处可调，日志用 `CONFIG.debug` 开关；
+14. **路径解析简化**：`parsePathProxy()` 只认 `sstp://` 与 ProxyIP 两种值，不再解析内嵌 query。
+
+---
+
+## 只支持两种出站
+
+| 落地写法 | 行为 |
+| --- | --- |
+| `1.2.3.4:443` / `域名` / `域名!txt` | **ProxyIP**：`connect(落地)`，由它按 SNI 反代到真正的目标 |
+| `sstp://host:443` | **SSTP**：SSTP over TLS → PPP → 虚拟 IPv4 → 手工 IPv4/TCP → 目标 |
+
+`socks5://`、`http(s)://`、`turn(s)://`、`?auto=1` 等一律不再支持（写了会连接失败，`CONFIG.debug = true` 时日志里会打 `unsupported proxy`）。
 
 ---
 
@@ -388,7 +395,8 @@ VLESS 的 UDP 只处理 **53 端口（DNS）**：Worker 把 DNS 查询包通过 
 - **trojan / ss 入站**：本仓库前端只做 VLESS（ws + xhttp）；
 - **XHTTP 的 `packet-up` / `stream-up` 模式**：需要跨请求会话表（多个 POST/GET 归并到一个会话），Worker 侧不维护会话；请用 `mode=stream-one`；
 - **gRPC 帧头**（`noGRPCHeader: false`）：不做 5 字节帧的拆装，必须开 `noGRPCHeader: true`；
-- **turn / turns 落地**：上游 `snippet.js` 有 STUN/TURN 实现，本仓库未纳入，需要请参考 [jacobax/snippets](https://github.com/jacobax/snippets)；
+- **socks5 / http(s) / turn(s) 落地**：按"只留 SSTP + ProxyIP"的要求已从代码里移除；需要这些链式落地请参考上游 [jacobax/snippets](https://github.com/jacobax/snippets)；
+- **自适应 proxyip（`?auto=1/2`，zjcloud 域名模板）与并发竞速拨号（`race`）**：已移除，`proxyip` 直接写死或用 `域名!txt` 轮换即可；
 - **订阅器**：不带前端与订阅转换，可搭配 [EDT](https://github.com/cmliu/edgetunnel) 或任意订阅器使用。
 
 ---
