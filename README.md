@@ -65,7 +65,7 @@ VLESS over WS/XHTTP
 
 | 项目 | 旧版 `CF-SoftEther` | 重构后 `cf-vpngate` |
 | --- | --- | --- |
-| 入站 | 仅 VLESS over WebSocket | **VLESS over WebSocket + VLESS over XHTTP**（含 Early Data） |
+| 入站 | 仅 VLESS over WebSocket | **VLESS over WebSocket + VLESS over XHTTP**（`mode=stream-one`、Early Data、padding 混淆） |
 | 后端 | 仅 SSTP（path 里写死 `sstp://`） | **SSTP + ProxyIP + !txt + socks5 + http(s)**，统一调度 |
 | DNS | 每次请求都打 DoH | DoH 结果缓存 3 分钟 + 同域名并发去重 |
 | TXT 落地 | 无 | 支持 `域名!txt`，列表缓存，随机取一条 |
@@ -120,6 +120,11 @@ Snippets 没有环境变量，改 UUID 直接在文件顶部改 `CONFIG.uuid`，
 | `upPack` | `65536` | 上行入队分片大小 |
 | `maxED` | `8192` | Early Data 最大长度 |
 | `hsMax` / `xhInit` / `xhNext` | `16384` / `32768` / `8192` | XHTTP 握手头最大等待字节、首读与后续读字节数 |
+| `xhttpHeaderTimeout` | `15000` | XHTTP 等待客户端首包（VLESS 头）的毫秒数 |
+| `xhttpPadding` | `true` | 是否在响应头回填 padding |
+| `xhttpPaddingHeader` / `xhttpPaddingKey` | `X-Cache` / `_dc` | padding 的头名 / 键名，需与客户端 extra 一致 |
+| `xhttpPaddingRange` | `[100, 1000]` | padding 长度区间，对应 extra 的 `xPaddingBytes` |
+| `xhttpStrictPadding` | `false` | 是否校验请求 padding 长度（严格模式） |
 | `mss` | `1400` | SSTP 隧道内 TCP 分片（**不要超过 1400**，受伪首部缓冲区 1432 限制） |
 | `sstpUser` / `sstpPass` | `vpn` / `vpn` | PPP 的 PAP 认证（VPN Gate 公共节点固定为 `vpn`/`vpn`） |
 | `dnsServer` / `dnsPort` | `1.1.1.1` / `53` | UDP(53) 转发的 TCP DNS 服务器 |
@@ -184,13 +189,13 @@ vless://495c7195-85b8-498a-bf20-2ea9ce9175b5@www.shopify.com:443?mode=stream-one
 | --- | --- |
 | `path` | URL 编码后的 `/fdip=<落地>?ed=2560` |
 | `host` / `sni` | Worker 自己的域名 |
-| `mode=stream-one` | XHTTP 建议模式 |
+| `mode=stream-one` | **必须是 `stream-one`**（一次 POST 承载一个完整会话） |
 | `alpn=h2` | XHTTP 走 h2，与 `mode` 搭配 |
 | `ed=2560` | 与客户端 Early Data 长度一致 |
 
-### xhttp extra（客户端 XHTTP 传输的 extra 配置，默认填这个）
+### 客户端 xhttp extra 怎么填
 
-留空也可以，效果自测。在 Xray 系客户端里填到 XHTTP 传输的 **extra** 文本框：
+打开客户端的 XHTTP 传输设置，把下面这段填进 **extra** 文本框（V2rayN / NekoBox / sing-box 里可能是 `Extra` 或 `extra`）：
 
 ```json
 {
@@ -209,7 +214,40 @@ vless://495c7195-85b8-498a-bf20-2ea9ce9175b5@www.shopify.com:443?mode=stream-one
 }
 ```
 
-服务端不需要为 padding 做额外处理：padding 落在 HTTP 请求头/查询里，不进 body，本实现直接按 `application/octet-stream` / `application/grpc` 读取请求体。
+逐项说明：
+
+| 字段 | 是否必填 | 说明 |
+| --- | --- | --- |
+| `noGRPCHeader` | **必填 `true`** | 关掉 gRPC 的 5 字节帧头。本实现按「裸 VLESS 头」解析请求体，**不填会直接返回 400** |
+| `headers.Content-Type` | 建议填 | 设成 `application/octet-stream`，与节点模板保持一致 |
+| `xPaddingBytes` | 可选 | padding 长度范围，对应 Worker 的 `xhttpPaddingRange` |
+| `xPaddingObfsMode` | 可选 | 开启 padding 混淆；Worker 会校验请求 padding 并在响应头回填 padding |
+| `xPaddingMethod` | 可选 | `tokenish` 即可 |
+| `xPaddingPlacement` | 可选 | `queryInHeader`：padding 放 query 里，query 再放进 header |
+| `xPaddingHeader` | 可选 | 承载 padding 的请求头名，默认 `X-Cache`；**改了要同步改 Worker 的 `xhttpPaddingHeader`** |
+| `xPaddingKey` | 可选 | padding 的 query 参数名，默认 `_dc`；**改了要同步改 Worker 的 `xhttpPaddingKey`** |
+
+不想手抄的话，直接 `curl https://你的域名/sub` 就能拿到这段 JSON 和对应节点链接。
+
+服务端对 padding 的处理（对齐 edgetunnel）：
+
+1. 从 `X-Cache` 请求头里取值，兼容 `?_dc=` 直接放 query、纯值 header，以及 edgetunnel 由 UUID 派生的头名/键名（默认 UUID 对应 `95c719` / `_ea9ce9`）；
+2. `xhttpStrictPadding = true` 时校验长度落在 `xhttpPaddingRange`，不合法直接 `400`；
+3. 响应头回填一个 100–1000 字符的随机 padding：`X-Cache: https://x.invalid/?_dc=<随机串>`。
+
+### 支持的 XHTTP 形态与错误码
+
+| 项 | 情况 |
+| --- | --- |
+| `mode=stream-one` | ✅ 支持（推荐） |
+| `mode=packet-up` / `stream-up` | ❌ 不支持：需要跨请求会话表，Worker 侧不维护会话 |
+| gRPC 帧（`noGRPCHeader: false`） | ❌ 不支持，首包解析失败返回 `400` |
+| 请求路由 | 任意 `POST` 都按 XHTTP 处理（与 edgetunnel 一致），`GET /sub` 除外 |
+| 首包解析失败 / UDP 非 53 / padding 非法 | `400`，响应体里带具体原因 |
+| 落地建连失败 | `502` |
+
+> 建连在返回响应**之前**完成，因此失败时客户端拿到的是干净的 `400` / `502`，而不是一条被中断的流；
+> 这条路径与 edgetunnel 的 `处理叉HTTP请求` 一致。
 
 ---
 
@@ -290,29 +328,33 @@ SYN → ← SYN+ACK → ACK → PSH+ACK(数据) … → FIN+ACK → ← FIN+ACK
 
 ## UDP(53)
 
-VLESS 的 UDP 只处理 **53 端口（DNS）**：Worker 把 DNS 查询包通过 TCP 发给 `1.1.1.1:53`，拿到带长度前缀的应答后原样回写给客户端。其它 UDP 目标直接断开（Worker 环境无原生 UDP 出站）。
+VLESS 的 UDP 只处理 **53 端口（DNS）**：Worker 把 DNS 查询包通过 TCP 发给客户端指定的 DNS 服务器（一般 `1.1.1.1:53`，解析不出时回落到 `CONFIG.dnsServer`），拿到带长度前缀的应答后原样回写给客户端。其它 UDP 目标直接断开（Worker 环境无原生 UDP 出站）。
 
 ---
 
 ## 优化点
 
 1. **去除了 trojan / ss 入站与 ss2022 加解密**：冷启动更快、内存更省，代码量减半；
-2. **DNS 缓存 + 并发去重**：同一域名 3 分钟内复用，并发请求共用一个查询；
-3. **TXT 列表缓存**：`!txt` 落地不会每连接都解析一次；
-4. **上行分片入队 + 出队合并**：把大量小 WebSocket 帧合并成 64KB 大包再写入 socket；
-5. **下行攒包 + 背压**：`bufferedAmount` 超阈值时用 `scheduler.wait` 让出事件循环，避免堆积导致内存飙升；
-6. **BYOB 读**：`getReader({ mode: 'byob' })` 直接读到复用缓冲区，少一次拷贝；
-7. **SSTP 收包缓冲区复用**：`ArrayBuffer` 在多次 `readAtLeast` 间复用；
-8. **超时统一**：握手 10s、长连接等待 60s，避免 Worker 空转；
-9. **半开连接**：`allowHalfOpen` + FIN 处理，落地侧先关闭时也能把残余数据回传；
-10. **异常收口**：所有路径 `try/catch`，`fetch` 一律返回合法 `Response`，不抛未捕获异常；
-11. **配置集中**：`CONFIG` 一处可调，日志用 `CONFIG.debug` 开关。
+2. **XHTTP 先建连再返回响应**：落地失败直接 `502`，首包/padding 非法直接 `400`，不再给客户端一条被中断的流；
+3. **XHTTP padding 对齐 edgetunnel**：请求侧提取 + 严格模式校验 + 响应侧回填随机 padding，obfs 行为与客户端 extra 匹配；
+4. **DNS 缓存 + 并发去重**：同一域名 3 分钟内复用，并发请求共用一个查询；
+5. **TXT 列表缓存**：`!txt` 落地不会每连接都解析一次；
+6. **上行分片入队 + 出队合并**：把大量小 WebSocket 帧合并成 64KB 大包再写入 socket；
+7. **下行攒包 + 背压**：`bufferedAmount` 超阈值时用 `scheduler.wait` 让出事件循环，避免堆积导致内存飙升；
+8. **BYOB 读**：`getReader({ mode: 'byob' })` 直接读到复用缓冲区，少一次拷贝；
+9. **SSTP 收包缓冲区复用**：`ArrayBuffer` 在多次 `readAtLeast` 间复用；
+10. **超时统一**：WS/XHTTP 首包等待超时、SSTP 握手 10s、长连接等待 60s，避免 Worker 空转；
+11. **半开连接**：`allowHalfOpen` + FIN 处理，落地侧先关闭时也能把残余数据回传；
+12. **异常收口**：`dialOutbound` 失败统一返回 `null`，所有路径 `try/catch`，`fetch` 一律返回合法 `Response`；
+13. **配置集中**：`CONFIG` 一处可调，日志用 `CONFIG.debug` 开关。
 
 ---
 
 ## 未包含的功能
 
 - **trojan / ss 入站**：本仓库前端只做 VLESS（ws + xhttp）；
+- **XHTTP 的 `packet-up` / `stream-up` 模式**：需要跨请求会话表（多个 POST/GET 归并到一个会话），Worker 侧不维护会话；请用 `mode=stream-one`；
+- **gRPC 帧头**（`noGRPCHeader: false`）：不做 5 字节帧的拆装，必须开 `noGRPCHeader: true`；
 - **turn / turns 落地**：上游 `snippet.js` 有 STUN/TURN 实现，本仓库未纳入，需要请参考 [jacobax/snippets](https://github.com/jacobax/snippets)；
 - **订阅器**：不带前端与订阅转换，可搭配 [EDT](https://github.com/cmliu/edgetunnel) 或任意订阅器使用。
 
@@ -337,7 +379,10 @@ VLESS 的 UDP 只处理 **53 端口（DNS）**：Worker 把 DNS 查询包通过 
 | --- | --- |
 | 1101 | 删除旧 Worker / 旧片段后重新部署 |
 | 连不上（ws） | 确认 `Upgrade: websocket`、path 中的 UUID 与 `CONFIG.uuid` 一致 |
-| xhttp 无响应 | 确认 `type=xhttp`、`mode=stream-one`、`Content-Type: application/octet-stream`（即 extra 里的 `noGRPCHeader: true`） |
+| xhttp 返回 400 且提示 `noGRPCHeader` | 客户端 extra 没开 `noGRPCHeader: true`，或路径/UUID 不对 |
+| xhttp 返回 400 且提示 padding | 客户端 `xPaddingHeader` / `xPaddingKey` 与 Worker 的 `CONFIG` 不一致（或关掉 `xhttpStrictPadding`） |
+| xhttp 返回 502 | 落地连不上：换 SSTP 节点 / ProxyIP，或加 `global=1`；响应体里带目标地址 |
+| xhttp 无响应 | 确认 `type=xhttp`、`mode=stream-one`、`alpn=h2` |
 | SSTP 落地失败 | 换节点、确认 443 端口、`wrangler tail` 看是否卡在 PPP；把 `CONFIG.debug` 设为 `true` |
 | UDP 不通 | 只支持 53 端口 DNS，其它 UDP 目标不支持 |
 | 目标被重置 | 试 `global=1` 强制走落地，或换 ProxyIP / 换 SSTP 节点 |

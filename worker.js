@@ -52,9 +52,18 @@ const CONFIG = {
   /** SSTP / PPP 的 PAP 认证信息（VPN Gate 公共节点固定为 vpn / vpn） */
   sstpUser: 'vpn',
   sstpPass: 'vpn',
-  /** UDP(53) 转发的 TCP DNS 服务器 */
+  /** UDP(53) 转发的 TCP DNS 服务器（仅当客户端目标解析不出时兜底） */
   dnsServer: '1.1.1.1',
   dnsPort: 53,
+  /** XHTTP：等待客户端首包（VLESS 头）的最长毫秒数 */
+  xhttpHeaderTimeout: 15000,
+  /** XHTTP padding：需与客户端 xhttp extra 的 xPadding* 一致 */
+  xhttpPadding: true,
+  xhttpPaddingHeader: 'X-Cache',
+  xhttpPaddingKey: '_dc',
+  xhttpPaddingRange: [100, 1000],
+  /** 请求带 padding 时是否校验长度（严格模式；默认宽松，避免误伤客户端） */
+  xhttpStrictPadding: false,
   /** 调试日志（Snippet 可在顶部改为 true 后用 `wrangler tail` 观察） */
   debug: false,
 };
@@ -82,6 +91,68 @@ const XHTTP_EXTRA = `{
     "xPaddingKey": "_dc"
   }
 }`;
+
+/**
+ * XHTTP padding 的「头名 / 键名」。
+ * 默认用 CONFIG 里的 `X-Cache` / `_dc`（与 extra 的 xPaddingHeader / xPaddingKey 对应），
+ * 同时兼容 edgetunnel 由 UUID 派生的名字：uuid.slice(1,7) / '_' + uuid.slice(25,31)。
+ */
+const paddingIds = uuid => ({
+  headers: [CONFIG.xhttpPaddingHeader, uuid.slice(1, 7)].filter(Boolean),
+  keys: [CONFIG.xhttpPaddingKey, `_${uuid.slice(25, 31)}`].filter(Boolean),
+});
+
+/**
+ * 取出请求中的 padding，支持客户端 xPaddingPlacement 的三种放置方式：
+ *   queryInHeader / header → 值在 header 里（可能是 `https://x/?_dc=xxx` 形态的 URL）
+ *   query                  → 值在请求 URL 的 query 里
+ */
+function extractXhttpPadding(request, uuid) {
+  const { headers, keys } = paddingIds(uuid);
+  for (const name of headers) {
+    const value = request.headers.get(name);
+    if (!value) continue;
+    try {
+      const inner = new URL(value, 'https://x.invalid');
+      for (const key of keys) {
+        const hit = inner.searchParams.get(key);
+        if (hit) return hit;
+      }
+    } catch { /* 不是 URL 形态，按原值处理 */ }
+    return value;
+  }
+  const url = new URL(request.url);
+  for (const key of keys) {
+    const hit = url.searchParams.get(key);
+    if (hit) return hit;
+  }
+  return '';
+}
+
+/** 客户端没开 padding 直接放行；严格模式下校验长度是否落在 xPaddingBytes 区间 */
+function paddingAcceptable(padding) {
+  if (!padding || !CONFIG.xhttpStrictPadding) return true;
+  const [min, max] = CONFIG.xhttpPaddingRange;
+  return padding.length >= min - 2 && padding.length <= max + 2;
+}
+
+const B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+const randomPadding = length => {
+  let out = '';
+  for (let i = 0; i < length; i++) out += B62[Math.floor(Math.random() * B62.length)];
+  return out;
+};
+
+/** 回填 padding 响应头（对齐 edgetunnel：头值是一个带 query 的 URL） */
+function applyPaddingHeader(headers) {
+  if (!CONFIG.xhttpPadding) return;
+  try {
+    const [min, max] = CONFIG.xhttpPaddingRange;
+    const url = new URL('https://x.invalid/');
+    url.searchParams.set(CONFIG.xhttpPaddingKey, randomPadding(min + Math.floor(Math.random() * (max - min + 1))));
+    headers.set(CONFIG.xhttpPaddingHeader, url.toString());
+  } catch { /* 头名非法则忽略 */ }
+}
 
 const EMPTY = new Uint8Array(0);
 const encoder = new TextEncoder();
@@ -287,7 +358,7 @@ function parseProxyAddress(raw) {
 
 /** 半开直连（保留半关闭能力，便于落地侧 FIN 之后的残余数据回传） */
 async function tcpConnect(host, port) {
-  const socket = connect({ hostname: host, port }, { allowHalfOpen: true });
+  const socket = connect({ hostname: String(host).replace(/^\[|\]$/g, ''), port }, { allowHalfOpen: true });
   try { await socket.opened; return socket; } catch (err) { tryClose(socket); throw err; }
 }
 
@@ -878,11 +949,16 @@ async function dialOutbound(targetHost, targetPort, proxy, globalMode) {
   const entry = await pickEntry();
   log('dial', targetHost, targetPort, 'via', entry.type, entry.host, entry.port);
 
-  if (entry.type === 'socks5') return socksConnect(entry, targetHost, targetPort);
-  if (entry.type === 'http' || entry.type === 'https') return httpConnect(entry, targetHost, targetPort);
-  if (entry.type === 'sstp') return sstpConnect(entry, targetHost, targetPort);
-  // ProxyIP：直连该 IP/域名，由它按 SNI 反代到真正的目标
-  return raceConnect(entry.host, entry.port);
+  try {
+    if (entry.type === 'socks5') return await socksConnect(entry, targetHost, targetPort);
+    if (entry.type === 'http' || entry.type === 'https') return await httpConnect(entry, targetHost, targetPort);
+    if (entry.type === 'sstp') return await sstpConnect(entry, targetHost, targetPort);
+    // ProxyIP：直连该 IP/域名，由它按 SNI 反代到真正的目标
+    return await raceConnect(entry.host, entry.port);
+  } catch (err) {
+    log('dial error', err?.message || err);
+    return null;
+  }
 }
 
 /* ==========================================================================
@@ -943,12 +1019,12 @@ function detectInbound(buffer, uuidBytes) {
  * 8. UDP(53) → TCP DNS
  * ========================================================================== */
 
-async function dnsOverTcp(query) {
+async function dnsOverTcp(query, host = CONFIG.dnsServer, port = CONFIG.dnsPort) {
   const request = toU8(query);
   for (let attempt = 0; attempt < 2; attempt++) {
     let socket;
     try {
-      socket = await raceConnect(CONFIG.dnsServer, CONFIG.dnsPort);
+      socket = await raceConnect(host, port);
       const writer = socket.writable.getWriter();
       const reader = socket.readable.getReader();
       let buffer = EMPTY;
@@ -1134,9 +1210,9 @@ async function pipeToWebSocket(readable, ws) {
   }
 }
 
-async function sendDnsResponse(query, ws) {
+async function sendDnsResponse(query, ws, host, port) {
   try {
-    const answer = await dnsOverTcp(query);
+    const answer = await dnsOverTcp(query, host, port);
     if (answer?.byteLength && ws.readyState === WebSocket.OPEN) ws.send(answer);
   } catch { /* 忽略 */ }
 }
@@ -1214,6 +1290,7 @@ async function handleWebSocket(request, uuidBytes, resolveProxy, globalMode) {
   let running = false;
   let handshakeDone = false;
   let dnsMode = false;
+  let dnsTarget = null;
   let earlyBuffer = null;
   let timer = setTimeout(() => { if (!handshakeDone) close(1000); }, 15000);
 
@@ -1250,7 +1327,7 @@ async function handleWebSocket(request, uuidBytes, resolveProxy, globalMode) {
           // UDP(53)：后续每个包都是一次独立 DNS 查询
           const query = queue.pack();
           if (!query) break;
-          await sendDnsResponse(query, server);
+          await sendDnsResponse(query, server, dnsTarget.host, dnsTarget.port);
           queue.drain();
           continue;
         }
@@ -1265,7 +1342,8 @@ async function handleWebSocket(request, uuidBytes, resolveProxy, globalMode) {
           if (session.udp) {
             if (session.port !== 53) throw new Error('udp only for dns');
             dnsMode = true;
-            await sendDnsResponse(session.payload, server);
+            dnsTarget = { host: session.host, port: session.port };
+            await sendDnsResponse(session.payload, server, dnsTarget.host, dnsTarget.port);
             queue.drain();
             continue;
           }
@@ -1353,8 +1431,34 @@ async function readSome(source, size) {
   return { done, value: value ? toU8(value) : EMPTY };
 }
 
-/** XHTTP 的 UDP(53)：按长度前缀切分，逐条走 TCP DNS 后写回响应流 */
-function createDnsResponder(writer, onError) {
+const xhttpError = (status, message) =>
+  new Response(`cf-vpngate: ${message}`, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+
+/**
+ * 攒齐 VLESS 首包。
+ * XHTTP 只实现 stream-one：一次 POST 承载一个完整会话，首包必须自带 VLESS 头，
+ * 即客户端需要开启 noGRPCHeader（这也是首包解析失败时最常见的原因）。
+ */
+async function readVlessHeader(source, uuidBytes) {
+  let buffer = EMPTY;
+  for (;;) {
+    if (buffer.byteLength >= 17 && !matchUuid(buffer, uuidBytes)) {
+      throw new Error('bad vless header；XHTTP 请设置 noGRPCHeader=true（或 Content-Type: application/octet-stream）');
+    }
+    const session = parseVlessHeader(buffer, uuidBytes);
+    if (session) return session;
+    if (buffer.byteLength >= CONFIG.hsMax) throw new Error('header too large');
+    const want = CONFIG.hsMax - buffer.byteLength;
+    const size = Math.min(buffer.byteLength === 0 ? CONFIG.xhInit : CONFIG.xhNext, want);
+    if (size <= 0) throw new Error('bad header');
+    const { done, value } = await readSome(source, size);
+    if (done) throw new Error('eof before vless header');
+    if (value.byteLength) buffer = buffer.byteLength ? concat(buffer, value) : value;
+  }
+}
+
+/** XHTTP 的 UDP(53)：按 2 字节长度前缀分包，逐条走 TCP DNS 后写进响应流 */
+function createDnsResponder(emit, dnsHost, dnsPort) {
   let buffered = EMPTY;
   let chain = Promise.resolve();
   let stopped = false;
@@ -1367,9 +1471,9 @@ function createDnsResponder(writer, onError) {
     while (buffered.byteLength - offset >= 2) {
       const end = offset + 2 + ((buffered[offset] << 8) | buffered[offset + 1]);
       if (buffered.byteLength < end) break;
-      const answer = await dnsOverTcp(buffered.slice(offset, end));
-      if (!answer) throw new Error('dns failed');
-      await writer.write(answer);
+      const answer = await dnsOverTcp(buffered.slice(offset, end), dnsHost, dnsPort);
+      if (!answer) throw new Error('dns query failed');
+      emit(answer);
       offset = end;
     }
     buffered = offset < buffered.byteLength ? buffered.slice(offset) : EMPTY;
@@ -1377,9 +1481,7 @@ function createDnsResponder(writer, onError) {
 
   return {
     write(data) {
-      chain = chain
-        .then(() => handle(data))
-        .catch(err => { stopped = true; onError(err); });
+      chain = chain.then(() => handle(data)).catch(err => { stopped = true; throw err; });
       return chain;
     },
     async finish() {
@@ -1390,105 +1492,120 @@ function createDnsResponder(writer, onError) {
   };
 }
 
-async function handleXhttp(request, uuidBytes, resolveProxy, globalMode) {
-  if (!request.body) return new Response(null, { status: 400 });
+/** UDP(53) 的响应：把 DNS 应答直接写进响应体 */
+function xhttpUdpResponse(session, source, headers) {
+  const stream = new ReadableStream({
+    async start(controller) {
+      const responder = createDnsResponder(byte => controller.enqueue(byte), session.host, session.port);
+      try {
+        if (session.payload.byteLength) await responder.write(session.payload);
+        for (;;) {
+          const { done, value } = await readSome(source, CONFIG.chunk);
+          if (done) break;
+          if (value.byteLength) await responder.write(value);
+        }
+        await responder.finish();
+      } catch (err) {
+        log('xhttp udp error', err?.message || err);
+      } finally {
+        releaseLock(source.reader);
+        try { controller.close(); } catch {}
+      }
+    },
+    cancel() {
+      try { source.reader.cancel(); } catch {}
+      releaseLock(source.reader);
+    },
+  });
+  return new Response(stream, { status: 200, headers });
+}
 
-  const highWaterMark = { highWaterMark: 262144 };
-  const transform =
-    typeof IdentityTransformStream === 'function'
-      ? new IdentityTransformStream(highWaterMark, highWaterMark)
-      : new TransformStream({}, highWaterMark, highWaterMark);
-
-  const source = byobReader(request.body);
-  const output = transform.writable.getWriter();
-
-  let remote = null;
-  let readerReleased = false;
+/** 响应已返回后开始搬运：VLESS 响应头 → 上行 / 下行双向 pipe */
+async function bridgeXhttp(session, source, request, remote, transform, output) {
+  const upstreamAbort = new AbortController();
+  const downstreamAbort = new AbortController();
   let outputReleased = false;
   let finished = false;
-  let upstreamAbort = null;
-  let downstreamAbort = null;
-  const timer = setTimeout(() => { try { source.reader.cancel(); } catch {} }, 15000);
 
-  const releaseReader = () => { if (!readerReleased) { readerReleased = true; releaseLock(source.reader); } };
-
-  function cleanup(reason) {
+  const cleanup = reason => {
     if (finished) return;
     finished = true;
-    if (timer) clearTimeout(timer);
-    try { upstreamAbort?.abort(reason); } catch {}
-    try { downstreamAbort?.abort(reason); } catch {}
-    releaseReader();
+    try { upstreamAbort.abort(reason); } catch {}
+    try { downstreamAbort.abort(reason); } catch {}
+    releaseLock(source.reader);
     tryClose(remote);
     if (!outputReleased) {
       outputReleased = true;
       try { output.abort(reason).catch(() => {}); } catch {}
       releaseLock(output);
     }
-  }
+  };
 
-  (async () => {
-    let buffer = EMPTY;
-    let session = null;
-
-    // 1) 攒够 VLESS 头
-    while (!session) {
-      if (buffer.byteLength >= 17 && !matchUuid(buffer, uuidBytes)) throw new Error('xhttp: bad header');
-      const parsed = parseVlessHeader(buffer, uuidBytes);
-      if (parsed) { session = parsed; break; }
-      if (buffer.byteLength >= CONFIG.hsMax) throw new Error('xhttp: bad header');
-      const want = CONFIG.hsMax - buffer.byteLength;
-      const size = Math.min(buffer.byteLength === 0 ? CONFIG.xhInit : CONFIG.xhNext, want);
-      if (size <= 0) throw new Error('xhttp: bad header');
-      const { done, value } = await readSome(source, size);
-      if (done) throw new Error('xhttp: eof');
-      if (value.byteLength) buffer = buffer.byteLength ? concat(buffer, value) : value;
-    }
-    if (timer) clearTimeout(timer);
-
-    // 2) 回 VLESS 响应头
+  try {
     if (session.responsePrefix.byteLength) await output.write(session.responsePrefix);
+    outputReleased = true;
+    releaseLock(output);
 
-    // 3) UDP(53)
-    if (session.udp) {
-      if (session.port !== 53) throw new Error('udp only for dns');
-      const dns = createDnsResponder(output, cleanup);
-      if (session.payload.byteLength) await dns.write(session.payload);
-      for (;;) {
-        const { done, value } = await readSome(source, CONFIG.chunk);
-        if (done) break;
-        if (value.byteLength) await dns.write(value);
-      }
-      await dns.finish();
-      releaseReader();
-      if (!outputReleased) {
-        outputReleased = true;
-        try { await output.close(); } finally { releaseLock(output); }
-      }
-      finished = true;
-      return;
-    }
-
-    // 4) 建立落地连接并双向 pipe
-    remote = await dialOutbound(session.host, session.port, resolveProxy, globalMode);
-    if (!remote) throw new Error('dial failed');
-
-    if (!outputReleased) { outputReleased = true; releaseLock(output); }
-    upstreamAbort = new AbortController();
-    downstreamAbort = new AbortController();
     const downstream = remote.readable.pipeTo(transform.writable, { signal: downstreamAbort.signal });
-
     if (session.payload.byteLength) {
       const writer = remote.writable.getWriter();
       try { await writer.write(session.payload); } finally { writer.releaseLock(); }
     }
 
-    releaseReader();
-    request.body.pipeTo(remote.writable, { signal: upstreamAbort.signal }).catch(err => { if (!finished) cleanup(err); });
-    downstream.catch(cleanup);
-  })().catch(cleanup);
+    releaseLock(source.reader);
+    request.body.pipeTo(remote.writable, { signal: upstreamAbort.signal }).catch(cleanup);
+    downstream.then(() => cleanup(), cleanup);
+  } catch (err) {
+    cleanup(err);
+  }
+}
 
-  return new Response(transform.readable, { status: 200, headers: XHTTP_HEADERS });
+async function handleXhttp(request, uuidBytes, uuid, resolveProxy, globalMode) {
+  if (!request.body) return xhttpError(400, 'empty body');
+  if (!paddingAcceptable(extractXhttpPadding(request, uuid))) return xhttpError(400, 'bad padding');
+
+  const source = byobReader(request.body);
+  const timer = setTimeout(() => { try { source.reader.cancel(); } catch {} }, CONFIG.xhttpHeaderTimeout);
+
+  let session;
+  try {
+    session = await readVlessHeader(source, uuidBytes);
+  } catch (err) {
+    clearTimeout(timer);
+    releaseLock(source.reader);
+    log('xhttp header error', err?.message || err);
+    return xhttpError(400, err?.message || 'bad request');
+  }
+  clearTimeout(timer);
+
+  if (session.udp && session.port !== 53) {
+    releaseLock(source.reader);
+    return xhttpError(400, 'udp only supports port 53');
+  }
+
+  const headers = new Headers(XHTTP_HEADERS);
+  applyPaddingHeader(headers);
+
+  if (session.udp) return xhttpUdpResponse(session, source, headers);
+
+  // 先建连再返回响应：失败时给出干净的 502，而不是一条被中断的流
+  const remote = await dialOutbound(session.host, session.port, resolveProxy, globalMode);
+  if (!remote) {
+    releaseLock(source.reader);
+    log('xhttp dial failed', session.host, session.port);
+    return xhttpError(502, `dial failed (${session.host}:${session.port})`);
+  }
+
+  const highWaterMark = { highWaterMark: 262144 };
+  const transform =
+    typeof IdentityTransformStream === 'function'
+      ? new IdentityTransformStream(highWaterMark, highWaterMark)
+      : new TransformStream({}, highWaterMark, highWaterMark);
+  const output = transform.writable.getWriter();
+
+  const response = new Response(transform.readable, { status: 200, headers });
+  void bridgeXhttp(session, source, request, remote, transform, output);
+  return response;
 }
 
 /* ==========================================================================
@@ -1514,10 +1631,10 @@ function buildShareText(request, env, url) {
     '## vless-ws',
     ws,
     '',
-    '## vless-xhttp',
+    '## vless-xhttp（mode 固定 stream-one；extra 必须开启 noGRPCHeader）',
     xhttp,
     '',
-    '## xhttp extra（客户端 XHTTP 传输的 extra 配置，留空亦可，效果自测）',
+    `## xhttp extra（xPaddingHeader / xPaddingKey 与 Worker 端 CONFIG 一致：${CONFIG.xhttpPaddingHeader} / ${CONFIG.xhttpPaddingKey}）`,
     XHTTP_EXTRA,
   ].join('\n');
 }
@@ -1531,12 +1648,11 @@ export default {
     try {
       const url = new URL(request.url);
       const upgrade = (request.headers.get('Upgrade') || '').toLowerCase();
-      const contentType = (request.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
 
       const isWebSocket = upgrade === 'websocket';
-      const isXhttp =
-        request.method === 'POST' &&
-        (contentType.startsWith('application/grpc') || contentType === 'application/octet-stream');
+      // XHTTP：与 edgetunnel 一致，POST 一律按 XHTTP 处理；
+      // 若客户端发了 gRPC 帧（noGRPCHeader=false），首包解析会失败并返回 400
+      const isXhttp = !isWebSocket && request.method === 'POST';
 
       if (!isWebSocket && !isXhttp) {
         // 非代理流量：/sub、/uuid 返回节点信息，其余静默 204
@@ -1569,7 +1685,7 @@ export default {
 
       return isWebSocket
         ? await handleWebSocket(request, uuidBytes, resolveProxy, globalMode)
-        : await handleXhttp(request, uuidBytes, resolveProxy, globalMode);
+        : await handleXhttp(request, uuidBytes, uuid, resolveProxy, globalMode);
     } catch (err) {
       log('fetch error', err?.message || err);
       return new Response(null, { status: 500 });
