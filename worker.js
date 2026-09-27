@@ -1655,6 +1655,15 @@ export default {
       const isXhttp = !isWebSocket && request.method === 'POST';
 
       if (!isWebSocket && !isXhttp) {
+        // XHTTP 的 packet-up / stream-up 会把下行做成 GET（带 x_session / x_seq），
+        // 本实现只支持 stream-one：这里明确回 400，别让客户端只看到静默 204 无从定位
+        if (url.searchParams.has('x_session') || url.searchParams.has('x_seq')) {
+          log('XHTTP 仅支持 mode=stream-one（packet-up/stream-up 需要跨请求会话表）', url.pathname);
+          return new Response(
+            'cf-vpngate: XHTTP only supports mode=stream-one；请把客户端 mode 设为 stream-one（packet-up/stream-up 不支持）',
+            { status: 400, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
+          );
+        }
         // 非代理流量：/sub、/uuid 返回节点信息，其余静默 204
         const path = url.pathname.replace(/\/+$/, '');
         if (path === '/sub' || path === '/uuid') {

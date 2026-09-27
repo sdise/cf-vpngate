@@ -239,8 +239,8 @@ vless://495c7195-85b8-498a-bf20-2ea9ce9175b5@www.shopify.com:443?mode=stream-one
 
 | 项 | 情况 |
 | --- | --- |
-| `mode=stream-one` | ✅ 支持（推荐） |
-| `mode=packet-up` / `stream-up` | ❌ 不支持：需要跨请求会话表，Worker 侧不维护会话 |
+| `mode=stream-one` | ✅ 支持（**必须显式指定**） |
+| `mode=packet-up` / `stream-up` | ❌ 不支持：它们用「一条 GET 下行 + 多个 POST 上行」并且要靠跨请求会话表关联，Worker 侧不维护会话 |
 | gRPC 帧（`noGRPCHeader: false`） | ❌ 不支持，首包解析失败返回 `400` |
 | 请求路由 | 任意 `POST` 都按 XHTTP 处理（与 edgetunnel 一致），`GET /sub` 除外 |
 | 首包解析失败 / UDP 非 53 / padding 非法 | `400`，响应体里带具体原因 |
@@ -248,6 +248,39 @@ vless://495c7195-85b8-498a-bf20-2ea9ce9175b5@www.shopify.com:443?mode=stream-one
 
 > 建连在返回响应**之前**完成，因此失败时客户端拿到的是干净的 `400` / `502`，而不是一条被中断的流；
 > 这条路径与 edgetunnel 的 `处理叉HTTP请求` 一致。
+
+#### ⚠️ 最容易踩的坑：不写 mode 就是 packet-up
+
+Xray 的 `mode` 为空或 `auto` 时并不是"自动挑一个能用的"，而是**直接按 packet-up 处理**：
+
+```go
+// Xray-core transport/internet/splithttp/dialer.go
+mode := transportConfiguration.Mode
+if mode == "" || mode == "auto" {
+    mode = "packet-up"
+    if realityConfig != nil {   // 只有 REALITY 才会自动变成 stream-one
+        mode = "stream-one"
+        if transportConfiguration.DownloadSettings != nil { mode = "stream-up" }
+    }
+}
+```
+
+而 v2rayN 的 `mode` 下拉默认值也是 `auto`（`Global.DefaultXhttpMode = "auto"`）。所以：
+
+- **手工在 v2rayN 里建节点**时，如果不手动把"模式"选成 `stream-one`（TLS 场景），客户端会用 packet-up；
+- packet-up 的下行是一条 `GET ...?x_session=<id>` 长连接请求，Worker 对非 POST/WS 请求只回 `204`；
+- 客户端日志就会出现：`transport/internet/splithttp: unexpected status 204`，随后 DNS 查询、网页全部失败。
+
+典型日志：
+
+```text
+[Info] transport/internet/splithttp: XHTTP is dialing to tcp:1.2.3.4:443, mode packet-up, HTTP version 2, host your.worker.domain
+[Info] transport/internet/splithttp: unexpected status 204
+[Error] app/dns: failed to retrieve response for xxx > Post "https://...": io: read/write on closed pipe
+```
+
+**处理办法**：把节点（或分享链接）的 `mode` 显式改成 `stream-one`。
+本仓库 `/sub` 生成的 xhttp 链接里已经带了 `mode=stream-one`，直接用它导入最省事。
 
 ---
 
@@ -382,6 +415,7 @@ VLESS 的 UDP 只处理 **53 端口（DNS）**：Worker 把 DNS 查询包通过 
 | xhttp 返回 400 且提示 `noGRPCHeader` | 客户端 extra 没开 `noGRPCHeader: true`，或路径/UUID 不对 |
 | xhttp 返回 400 且提示 padding | 客户端 `xPaddingHeader` / `xPaddingKey` 与 Worker 的 `CONFIG` 不一致（或关掉 `xhttpStrictPadding`） |
 | xhttp 返回 502 | 落地连不上：换 SSTP 节点 / ProxyIP，或加 `global=1`；响应体里带目标地址 |
+| 日志 `unexpected status 204` | 客户端在用 **packet-up**（`mode` 没写或为 `auto`）。必须显式设 `mode=stream-one`（v2rayN：传输协议 xhttp → 模式选 `stream-one`） |
 | xhttp 无响应 | 确认 `type=xhttp`、`mode=stream-one`、`alpn=h2` |
 | SSTP 落地失败 | 换节点、确认 443 端口、`wrangler tail` 看是否卡在 PPP；把 `CONFIG.debug` 设为 `true` |
 | UDP 不通 | 只支持 53 端口 DNS，其它 UDP 目标不支持 |
