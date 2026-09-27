@@ -1,0 +1,11 @@
+name = "cf-vpngate"
+main = "worker.js"
+compatibility_date = "2026-09-25"
+
+# 说明：
+#   1) 本项目同时兼容 Cloudflare Worker（wrangler 部署）与 Snippets（整段粘贴）。
+#   2) UUID 可通过下面的 vars 覆盖，也可以直接用全局常量，或在 Snippets 顶部写 `UUID = "..."`。
+#   3) 落地地址（SSTP / ProxyIP / !txt / socks5 / http(s)）走 path 传入，无需在此配置。
+
+[vars]
+# UUID = "495c7195-85b8-498a-bf20-2ea9ce9175b5"

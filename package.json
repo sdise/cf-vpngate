@@ -1,0 +1,16 @@
+{
+  "name": "cf-vpngate",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker：VLESS(WS/XHTTP) 入站 → SSTP(VPN Gate 公共节点) / ProxyIP 出站",
+  "main": "worker.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
