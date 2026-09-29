@@ -194,18 +194,12 @@ vless://495c7195-85b8-498a-bf20-2ea9ce9175b5@www.shopify.com:443?mode=stream-one
 
 ```json
 {
-"extra": {
-  "noGRPCHeader": true,
-  "headers": {
-    "Content-Type": "application/octet-stream"
-  },
   "xPaddingBytes": "100-1000",
   "xPaddingObfsMode": true,
   "xPaddingMethod": "tokenish",
   "xPaddingPlacement": "queryInHeader",
   "xPaddingHeader": "X-Cache",
   "xPaddingKey": "_dc"
-}
 }
 ```
 
