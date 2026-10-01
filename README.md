@@ -9,6 +9,7 @@
 
 ## 目录
 
+- [上下文摘要](#上下文摘要)
 - [架构](#架构)
 - [源码结构（src/）](#源码结构-src)
 - [这次重构做了什么](#这次重构做了什么)
@@ -26,6 +27,90 @@
 - [限制与已知问题](#限制与已知问题)
 - [排障](#排障)
 - [许可与鸣谢](#许可与鸣谢)
+
+---
+
+## 上下文摘要
+
+> 本节是项目「分析 / 优化 / 部署测试」的压缩上下文，用于快速载入全局认知；具体细节见后续各章。
+
+### 定位
+
+- **是什么**：Cloudflare Worker，前端 **VLESS over WS / XHTTP**，后端**仅两种出站**：`SSTP`（VPN Gate 公共节点）+ `ProxyIP`（含 `域名!txt`）。
+- **不是**普通 `WS → connect() → 目标` 转发：走 SSTP 时 Worker 内部完成 **SSTP over TLS → PPP(LCP/PAP/IPCP) → 虚拟 IPv4 → 手工 IPv4/TCP 封包**，再与目标通信。
+- **来源/对齐基准**：由旧仓库 `CF-SoftEther` 重构而来，**冲突处一律以上游 [jacobax/snippets](https://github.com/jacobax/snippets) 的 `snippet.js` 为准**。
+- **性质**：协议研究/学习代码，非稳定 VPN，不做可用性承诺。许可 GPL-3.0。
+
+### 架构
+
+```text
+客户端(v2rayN/Xray/sing-box) --VLESS over WS 或 XHTTP-->
+Cloudflare Worker
+  ├─ 直连 connect(目标)                ← 默认兜底
+  └─ 落地（仅两种）
+       ├─ ProxyIP  connect(proxyip:443)，按 SNI 反代到目标
+       ├─ SSTP     SSTP over TLS → PPP → 虚拟 IPv4 → 手工 TCP → 目标
+       └─ 域名!txt  从 TXT 随机取一条上面两种地址
+--> 目标站点
+```
+
+- **出站顺序默认**：**先落地 → 失败/超时 → 再直连**（不是先直连）。`global=1` 只走落地且关闭建连超时；`race=1` 并发竞速。
+- **竞速「就绪」判定**：SSTP 候选须完成**隧道内 TCP 三次握手（拿到目标 SYN+ACK）**才算就绪；ProxyIP/直连只到 TCP 建连。竞速不发应用层请求。
+
+### 源码结构与构建
+
+- 唯一手写目录 `src/`，构建产出两个单文件：`worker.js` 可读版（~88 KB，wrangler 部署）与 `snippet.js` 压缩版（~31.5 KB，**仅体积对照，Snippets 跑不动**）。
+- **约束**：合并后同作用域，**模块间不得有同名顶层标识符**（`npm run build` 后 `node --check` 会暴露）。
+- 命令：`npm run build`（含 snippet ≤32KB 与语法校验）、`npm run check`（产物是否与 src 同步，不写文件）、`npm run deploy`（build + wrangler deploy）、`npm run dev`、`npm run tail`。
+
+### 关键配置（`src/config.js` → `CONFIG`）
+
+- `uuid=495c7195-85b8-498a-bf20-2ea9ce9175b5`（可用 Worker 变量 `UUID` 覆盖）；`proxyip=proxyip.example.com!txt`（**占位值，必须用 `fdip=` 给真实落地**）。
+- **超时（据 2026-10 探针实测定，原 3000 有害）**：`dialTimeoutMs=4500`、`sstpConnectMs=5000`、`sstpHandshakeMs=1500`。
+- SSTP：`mss=1400`（**不可调大**，伪首部缓冲固定 1432）、`sstpReuseTunnel=true`、`sstpMaxStreams=8`、`sstpRetransmit/RtoMs/MaxRetries=true/1000/5`。
+- 队列/背压：`maxQueueBytes/maxQueueTotalBytes=8MB/32MB`、`wsBackpressureBytes/Release=256KB/64KB`、`dnAdaptive/dnAdaptiveBps=true/262144`。
+- DNS：`dnsServer/dnsPort=1.1.1.1/53`、`dnsNegativeTtlMs=30000`、`dnsAnswerTtlMs=60000`（DoH 正缓存 3 分钟 + 并发去重）。
+- 落地策略：`dialFailThreshold/Cooldown=3/30000`、`dialRaceCandidates=2`、`allowClientGlobal=true`、`blockedPorts=[]`。
+- XHTTP：`xhttpPadding=true`、`xhttpPaddingHeader/Key=a290fd/_d8d344`、`xhttpPaddingRange=[100,1000]`、`xhttpStrictPadding=false`。
+- `/sub` 访问控制：`subAuth='uuid'`（定长时间比较）/`off`/`none`；调试：`debug=false`。完整表见[配置](#配置)。
+
+### 部署
+
+- **方式一（推荐）**：`npm i && npx wrangler login && npm run deploy`（保留 `wrangler.toml`：`main=worker.js`、`compatibility_date=2026-09-25`）。
+- **方式二**：Dashboard 新建 Worker → 快速编辑 → 粘贴 `worker.js` → 部署 → 绑自定义域。
+- **方式三 Snippets：不可用，勿部署**（执行 5ms / 内存 2MB / 子请求 2~5 的限制，见[部署](#部署)）。
+- ⚠️ **Snippet 与 Worker 同域会抢流量**（`Snippets → Worker`），表现为"两个都连不上"→ 去 规则→Snippets 删规则。
+- ⚠️ 出现 **1101**：删旧片段/旧 Worker 后重新部署。
+
+### 测试与部署验证
+
+- `npm test`：`scripts/smoke.mjs` 纯逻辑冒烟（不需要 wrangler/网络），`cloudflare:sockets` 用 stub 顶替。
+- `npm run test:exit-ip`：端到端断言「出口 IP 属 SSTP 节点网段」，5 步链（CSV `IP` 列取 `expectedIp` → 隧道内 DNS → 隧道内 HTTPS 取 `exitIp` → 本机直连取 `localIp` → 断言 `exitIp != localIp` 且同网段）。
+- `npm run probe`：`scripts/sstp-probe.mjs`，用 **Node 原生 socket** 建隧道（能过 TUN），量各段耗时并给超时建议。
+- **三条硬性注意**：
+  1. **必须带 `global=1`**（脚本默认加），否则落地失败回落直连 → **假通过**。
+  2. **本地 `wrangler dev` 连不上通常是网络而非代码**：workerd 的 `connect()` **不走 TUN**，本地失败**不能判定线上失败** → 用 `--url wss://...` 打线上 Worker。
+  3. **SSTP crypto binding 节点不兼容 Worker**（含 `public-vpn-153`）：服务端要求 `CRYPT_BINDING_RESP`，Node 能算（`getPeerCertificate().raw`），**Workers 拿不到对端证书** → 卡建链。探针打 `⚠ 该节点要求 SSTP crypto binding` → **看到就换节点**。
+- **实测出口（2026-10）**：本机 TUN 出口 `61.124.1.97`(ASN 2497)；`public-vpn-68/100.opengw.net` 隧道出口 `219.100.37.234/236`，与节点 IP **同 /24、同 ASN 36599**（节点做 NAT，出口≠接入，断言只能"同网段"）。
+- **CSV vs API 字段别混用**：API `HostName`=短名（无域名）；CSV `Hostname`=完整域名，期望 IP 取自 CSV `IP` 列（不依赖 DNS）。判定逻辑见 `scripts/vpngate-csv.mjs` 的 `relationToNode()`。
+
+### 优化点（已落地）
+
+- 功能瘦身（入站仅 VLESS，出站仅 SSTP+ProxyIP）；XHTTP **先建连再返回响应**（失败给干净 `400/502`）；padding 对齐 edgetunnel。
+- DNS 缓存+并发去重、负缓存、UDP(53) 应答缓存；TXT 列表缓存。
+- 上行分片入队+出队合并；下行攒包 64KB + `bufferedAmount` 背压感知；BYOB 零拷贝读；SSTP 收包缓冲复用。
+- **SSTP 隧道复用**（按 `user:pass@host:port` 分池，按目的端口分发；冷路径从"每次全量建链"降到"隧道内一次握手"）。
+- 隧道内 TCP 可靠性修正（只收 `seq===ack`、窗口随缓冲变化+0 窗口背压、简化重传、读循环不设读超时）。
+- checksum 32 位宽累加；XHTTP 首包预分配缓冲（避免 O(n²)）；UUID 前缀只校验一次；全局队列预算防叠加 OOM；半开连接 + 异常统一收口。完整列表见[优化点](#优化点)。
+
+### 已知坑与限制
+
+- **XHTTP 必须显式 `mode=stream-one`**：`mode` 空或 `auto` → Xray 按 `packet-up` 处理（仅 REALITY 自动变 stream-one），v2rayN 默认也是 `auto` → 下行 GET 被回 `204` → 日志 `unexpected status 204`，全盘失败。
+- `noGRPCHeader` **必须 true**（本实现按裸 VLESS 头解析，否则 400）；`alpn=h2`。
+- 只支持 TCP 目标，**UDP 仅 53**（转 TCP DNS）；Workers 无原生 UDP 出站。
+- SSTP 本身只有 TCP → **TCP-over-TCP**，丢包双重重传放大。
+- 不支持：XHTTP `packet-up/stream-up`、gRPC 帧、socks5/http(s)/turn(s) 落地、自适应 proxyip。
+- 不依赖任何绑定（无 KV/DO/Cache API/env），缓存全是 isolate 级 `Map` → **不跨实例共享**，冷启动/多实例需重建。
 
 ---
 
