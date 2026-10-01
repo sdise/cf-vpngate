@@ -6,11 +6,17 @@
   "main": "worker.js",
   "type": "module",
   "scripts": {
+    "build": "node scripts/build.js",
+    "check": "node scripts/build.js --check",
+    "test": "node scripts/smoke.mjs",
+    "test:exit-ip": "node scripts/exit-ip.mjs",
+    "probe": "node scripts/sstp-probe.mjs",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "npm run build && wrangler deploy",
     "tail": "wrangler tail"
   },
   "devDependencies": {
+    "esbuild": "^0.28.2",
     "wrangler": "^4.0.0"
   }
 }
